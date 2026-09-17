@@ -28,9 +28,16 @@ function parseDatabaseUrl(url) {
 
 const dbFromUrl = process.env.DATABASE_URL ? parseDatabaseUrl(process.env.DATABASE_URL) : null;
 
-const required = dbFromUrl
-  ? ['JWT_SECRET']
-  : ['DB_HOST', 'DB_USER', 'DB_NAME', 'JWT_SECRET'];
+// MONGODB_URI is required once the app runs on Mongo. The MySQL vars stay
+// accepted (and required only if MONGODB_URI is absent) so the migration
+// script can read the old database and write the new one in one process.
+const hasMongo = Boolean(process.env.MONGODB_URI);
+
+const required = hasMongo
+  ? ['MONGODB_URI', 'JWT_SECRET']
+  : dbFromUrl
+    ? ['JWT_SECRET']
+    : ['DB_HOST', 'DB_USER', 'DB_NAME', 'JWT_SECRET'];
 
 for (const key of required) {
   if (!process.env[key]) {
@@ -81,6 +88,14 @@ export const env = {
     database: dbFromUrl?.database ?? process.env.DB_NAME,
     connectionLimit: Number(process.env.DB_CONNECTION_LIMIT) || 10,
     ssl: buildSslConfig(),
+  },
+
+  mongo: {
+    uri: process.env.MONGODB_URI,
+    // The SRV URI from Atlas often carries no database path, and a
+    // missing dbName silently lands everything in "test".
+    dbName: process.env.MONGODB_DB || 'shope_clothes',
+    poolSize: Number(process.env.MONGODB_POOL_SIZE) || 10,
   },
 
   jwt: {
