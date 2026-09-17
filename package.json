@@ -1,0 +1,21 @@
+{
+  "name": "shope-clothes",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "admin",
+    "backend",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,shop,admin -c blue,green,magenta \"npm:dev:api\" \"npm:dev:shop\" \"npm:dev:admin\"",
+    "dev:api": "npm run dev --workspace=backend",
+    "dev:shop": "npm run dev --workspace=frontend",
+    "dev:admin": "npm run dev --workspace=admin",
+    "build": "npm run build --workspace=frontend && npm run build --workspace=admin"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}

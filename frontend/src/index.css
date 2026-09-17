@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Hide native range-input thumbs/track so the dual-range price slider
+   can render its own custom-styled thumbs consistently cross-browser. */
+input[type='range'].price-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  pointer-events: none;
+}
+input[type='range'].price-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #1c1917;
+  cursor: pointer;
+  margin-top: -6px;
+}
+input[type='range'].price-range::-moz-range-thumb {
+  pointer-events: auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #1c1917;
+  cursor: pointer;
+  border: none;
+}
+input[type='range'].price-range::-webkit-slider-runnable-track {
+  height: 4px;
+}

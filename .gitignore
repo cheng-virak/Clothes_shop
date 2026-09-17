@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.log
+.DS_Store
+
+# Uploaded product images ARE committed: the seeded products reference
+# these exact filenames, so a fresh clone would otherwise render the demo
+# with broken images. Real deployments should point multer at object
+# storage instead of serving user uploads out of the repo.
+
+# Local DB backups taken before migrations — not meant to be committed
+backend/backups/
