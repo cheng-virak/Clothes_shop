@@ -16,6 +16,9 @@ export const pool = mysql.createPool({
   connectionLimit: env.db.connectionLimit,
   queueLimit: 0,
   decimalNumbers: true, // return DECIMAL columns as JS numbers instead of strings
+  // undefined for local dev (no TLS on a loopback socket); set when
+  // DB_SSL=true for hosted MySQL, which always requires it. See env.js.
+  ...(env.db.ssl ? { ssl: env.db.ssl } : {}),
 });
 
 export async function checkDbConnection() {
