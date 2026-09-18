@@ -6,13 +6,26 @@ import { env } from './env.js';
  * its own internal connection pool, so there's no pool object to pass
  * around; models are imported directly wherever they're needed.
  */
+// Cached so repeated calls (server.js at boot, or the per-request guard in
+// app.js on serverless hosts like Vercel) share one connection.
+let connecting = null;
+
 export async function connectMongo() {
-  mongoose.set('strictQuery', true);
-  await mongoose.connect(env.mongo.uri, {
-    dbName: env.mongo.dbName,
-    maxPoolSize: env.mongo.poolSize,
-    serverSelectionTimeoutMS: 10000,
-  });
+  if (mongoose.connection.readyState === 1) return mongoose.connection;
+  if (!connecting) {
+    mongoose.set('strictQuery', true);
+    connecting = mongoose
+      .connect(env.mongo.uri, {
+        dbName: env.mongo.dbName,
+        maxPoolSize: env.mongo.poolSize,
+        serverSelectionTimeoutMS: 10000,
+      })
+      .catch((err) => {
+        connecting = null; // allow a retry on the next request
+        throw err;
+      });
+  }
+  await connecting;
   return mongoose.connection;
 }
 
