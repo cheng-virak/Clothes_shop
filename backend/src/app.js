@@ -9,8 +9,16 @@ import routes from './routes/index.js';
 import { notFoundHandler, errorHandler } from './middlewares/error.middleware.js';
 import { UPLOADS_DIR } from './middlewares/upload.middleware.js';
 import { ApiError } from './utils/ApiError.js';
+import { connectMongo } from './config/mongo.js';
 
 const app = express();
+
+// On serverless hosts (Vercel) this module is the entrypoint and server.js
+// never runs, so make sure MongoDB is connected before any route runs.
+// Locally it's a no-op: server.js has already connected.
+app.use((req, res, next) => {
+  connectMongo().then(() => next(), next);
+});
 
 app.use(helmet());
 // Explicit allowlist from env.corsOrigins — never a wildcard, even though
