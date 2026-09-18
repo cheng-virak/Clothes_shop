@@ -124,7 +124,7 @@ function OverviewForm({ product, categories, onSaved }) {
   const isDirty =
     title !== product.title ||
     description !== (product.description ?? '') ||
-    Number(categoryId) !== product.category_id ||
+    categoryId !== product.category_id ||
     Number(basePrice) !== Number(product.base_price);
 
   async function handleSubmit(e) {
@@ -144,7 +144,7 @@ function OverviewForm({ product, categories, onSaved }) {
       await updateProduct(product.id, {
         title: title.trim(),
         description: description.trim() || null,
-        categoryId: Number(categoryId),
+        categoryId,
         basePrice: price,
       });
       toast.success('Product updated');

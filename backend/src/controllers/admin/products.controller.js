@@ -1,218 +1,193 @@
-import { pool } from '../../config/db.js';
+import { Category, Order, Product, getSettings } from '../../models/index.js';
 import { ApiError } from '../../utils/ApiError.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { logAudit } from '../../utils/auditLog.js';
 
 const SORT_CLAUSES = {
-  newest: 'p.updated_at DESC',
-  title_asc: 'p.title ASC',
-  price_asc: 'min_price ASC',
-  price_desc: 'max_price DESC',
-  stock_asc: 'total_stock ASC',
-  stock_desc: 'total_stock DESC',
+  newest: { updatedAt: -1 },
+  title_asc: { title: 1 },
+  price_asc: { minPrice: 1 },
+  price_desc: { maxPrice: -1 },
+  stock_asc: { totalStock: 1 },
+  stock_desc: { totalStock: -1 },
 };
 
 /**
  * GET /api/admin/products
- * admin only. Unlike the public GET /api/products, this shows every
- * status (draft/active/archived) and aggregates price range + total
- * stock across variants IN SQL — never fetched whole and summed in JS.
+ * admin only. Shows every status (draft/active/archived) and aggregates
+ * price range + total stock across the embedded variants. The aggregation
+ * runs in the database, never by fetching rows and summing in JS.
  */
 export const listAdminProducts = asyncHandler(async (req, res) => {
   const { q, category, status, stockState, sort, page, limit } = req.query;
+  const settings = await getSettings();
+  const lowStockThreshold = settings.lowStockThreshold;
 
-  const [[{ low_stock_threshold: lowStockThreshold }]] = await pool.execute(
-    'SELECT low_stock_threshold FROM settings WHERE id = 1'
-  );
-
-  const where = [];
-  const params = [];
-
+  const match = {};
+  if (status) match.status = status;
   if (category) {
-    where.push('c.slug = ?');
-    params.push(category);
-  }
-  if (status) {
-    where.push('p.status = ?');
-    params.push(status);
+    const categoryDoc = await Category.findOne({ slug: category }).select('_id').lean();
+    match.category = categoryDoc ? categoryDoc._id : null;
   }
   if (q) {
-    where.push(
-      '(p.title LIKE ? OR EXISTS (SELECT 1 FROM product_variants v2 WHERE v2.product_id = p.id AND v2.sku LIKE ?))'
-    );
-    const like = `%${q}%`;
-    params.push(like, like);
+    const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rx = new RegExp(safe, 'i');
+    match.$or = [{ title: rx }, { 'variants.sku': rx }];
   }
 
-  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  // Computed once here and reused for both the count and the page, so the
+  // stockState filter can be applied to the aggregate rather than the row.
+  const computeStage = {
+    $addFields: {
+      totalStock: { $sum: '$variants.stockQuantity' },
+      minPrice: {
+        $min: {
+          $map: {
+            input: { $ifNull: ['$variants', []] },
+            as: 'v',
+            in: { $ifNull: ['$$v.priceOverride', '$basePrice'] },
+          },
+        },
+      },
+      maxPrice: {
+        $max: {
+          $map: {
+            input: { $ifNull: ['$variants', []] },
+            as: 'v',
+            in: { $ifNull: ['$$v.priceOverride', '$basePrice'] },
+          },
+        },
+      },
+    },
+  };
 
-  const having = [];
-  const havingParams = [];
-  if (stockState === 'out_of_stock') {
-    having.push('total_stock = 0');
-  } else if (stockState === 'low_stock') {
-    having.push('total_stock > 0 AND total_stock <= ?');
-    havingParams.push(lowStockThreshold);
-  } else if (stockState === 'in_stock') {
-    having.push('total_stock > ?');
-    havingParams.push(lowStockThreshold);
-  }
-  const havingClause = having.length ? `HAVING ${having.join(' AND ')}` : '';
+  const stockMatch = {};
+  if (stockState === 'out_of_stock') stockMatch.totalStock = 0;
+  else if (stockState === 'low_stock') stockMatch.totalStock = { $gt: 0, $lte: lowStockThreshold };
+  else if (stockState === 'in_stock') stockMatch.totalStock = { $gt: lowStockThreshold };
 
-  // Aggregation (price range, total stock) happens once here in SQL and is
-  // reused for both the count and the page — counting a GROUP BY/HAVING
-  // query means counting the number of GROUPS, so it's wrapped as a
-  // subquery rather than a plain COUNT(*) over the joined rows.
-  const baseQuery = `
-    SELECT p.id,
-           COALESCE(SUM(v.stock_quantity), 0) AS total_stock,
-           MIN(COALESCE(v.price_override, p.base_price)) AS min_price,
-           MAX(COALESCE(v.price_override, p.base_price)) AS max_price
-    FROM products p
-    JOIN categories c ON c.id = p.category_id
-    LEFT JOIN product_variants v ON v.product_id = p.id
-    ${whereClause}
-    GROUP BY p.id
-    ${havingClause}
-  `;
+  const pipeline = [{ $match: match }, computeStage];
+  if (Object.keys(stockMatch).length > 0) pipeline.push({ $match: stockMatch });
 
-  const [countRows] = await pool.execute(
-    `SELECT COUNT(*) AS total FROM (${baseQuery}) AS grouped`,
-    [...params, ...havingParams]
-  );
-  const total = countRows[0].total;
-  const offset = (page - 1) * limit;
-  const orderByClause = SORT_CLAUSES[sort] ?? SORT_CLAUSES.newest;
+  const [countResult] = await Product.aggregate([...pipeline, { $count: 'total' }]);
+  const total = countResult?.total ?? 0;
 
-  const [rows] = await pool.execute(
-    `SELECT p.id, p.title, p.slug, p.status, p.updated_at,
-            c.name AS category_name, c.slug AS category_slug,
-            -- ANY_VALUE: this LEFT JOIN is guaranteed 0-or-1 rows per
-            -- product (at most one product_images row has is_primary =
-            -- TRUE, enforced by the upload/set-primary endpoints) — but
-            -- MySQL's ONLY_FULL_GROUP_BY can't infer that through a JOIN,
-            -- so it needs this explicit hint rather than a real aggregate.
-            ANY_VALUE(pi.image_url) AS thumbnail,
-            COALESCE(SUM(v.stock_quantity), 0) AS total_stock,
-            MIN(COALESCE(v.price_override, p.base_price)) AS min_price,
-            MAX(COALESCE(v.price_override, p.base_price)) AS max_price
-     FROM products p
-     JOIN categories c ON c.id = p.category_id
-     LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = TRUE
-     LEFT JOIN product_variants v ON v.product_id = p.id
-     ${whereClause}
-     GROUP BY p.id
-     ${havingClause}
-     ORDER BY ${orderByClause}
-     LIMIT ${Number(limit)} OFFSET ${Number(offset)}`,
-    [...params, ...havingParams]
-  );
+  const docs = await Product.aggregate([
+    ...pipeline,
+    { $sort: SORT_CLAUSES[sort] ?? SORT_CLAUSES.newest },
+    { $skip: (page - 1) * limit },
+    { $limit: limit },
+    { $lookup: { from: 'categories', localField: 'category', foreignField: '_id', as: 'category' } },
+    { $unwind: { path: '$category', preserveNullAndEmptyArrays: true } },
+  ]);
+
+  const data = docs.map((p) => ({
+    id: p._id.toString(),
+    title: p.title,
+    slug: p.slug,
+    status: p.status,
+    updated_at: p.updatedAt,
+    category_name: p.category?.name ?? null,
+    category_slug: p.category?.slug ?? null,
+    thumbnail: p.images?.find((i) => i.isPrimary)?.imageUrl ?? null,
+    total_stock: p.totalStock ?? 0,
+    min_price: p.minPrice ?? p.basePrice,
+    max_price: p.maxPrice ?? p.basePrice,
+  }));
 
   res.json({
     success: true,
-    data: rows,
+    data,
     meta: { page, limit, total, totalPages: Math.ceil(total / limit), lowStockThreshold },
   });
 });
 
 /**
  * GET /api/admin/products/:id
- * admin only. Status-agnostic lookup (draft/active/archived all work) —
- * the public GET /api/products/:id 404s on anything but 'active' by
- * design, so staff need this separate endpoint to open a draft for
- * editing. Same shape as the public single-product response (product +
- * images + variants), plus `status` for the editor's status control.
+ * admin only. Status-agnostic (draft/active/archived all work) — the
+ * public GET /api/products/:id 404s on anything but 'active', so staff
+ * need this to open a draft for editing.
  */
 export const getAdminProduct = asyncHandler(async (req, res) => {
-  const { id } = req.params;
-
-  const [productRows] = await pool.execute(
-    `SELECT p.id, p.title, p.slug, p.description, p.base_price, p.status, p.updated_at,
-            c.id AS category_id, c.name AS category_name, c.slug AS category_slug
-     FROM products p
-     JOIN categories c ON c.id = p.category_id
-     WHERE p.id = ?
-     LIMIT 1`,
-    [id]
-  );
-  const product = productRows[0];
+  const product = await Product.findById(req.params.id).populate('category', 'name slug');
   if (!product) throw ApiError.notFound('Product not found');
 
-  const [images] = await pool.execute(
-    `SELECT id, image_url, is_primary, sort_order
-     FROM product_images
-     WHERE product_id = ?
-     ORDER BY sort_order ASC`,
-    [product.id]
-  );
-
-  const [variants] = await pool.execute(
-    `SELECT v.id AS variantId, v.sku, v.stock_quantity AS stockQuantity,
-            COALESCE(v.price_override, ?) AS price,
-            s.code AS size,
-            col.name AS color, col.hex_code AS colorHex
-     FROM product_variants v
-     JOIN sizes s ON s.id = v.size_id
-     JOIN colors col ON col.id = v.color_id
-     WHERE v.product_id = ?
-     ORDER BY s.id ASC, col.name ASC`,
-    [product.base_price, product.id]
-  );
-
-  res.json({ success: true, data: { ...product, images, variants } });
+  res.json({
+    success: true,
+    data: {
+      id: product._id.toString(),
+      title: product.title,
+      slug: product.slug,
+      description: product.description,
+      base_price: product.basePrice,
+      status: product.status,
+      updated_at: product.updatedAt,
+      category_id: product.category?._id?.toString() ?? null,
+      category_name: product.category?.name ?? null,
+      category_slug: product.category?.slug ?? null,
+      images: product.images
+        .slice()
+        .sort((a, b) => a.sortOrder - b.sortOrder)
+        .map((i) => ({
+          id: i._id.toString(),
+          image_url: i.imageUrl,
+          is_primary: i.isPrimary,
+          sort_order: i.sortOrder,
+        })),
+      variants: product.variants.map((v) => ({
+        variantId: v._id.toString(),
+        sku: v.sku,
+        stockQuantity: v.stockQuantity,
+        price: v.priceOverride ?? product.basePrice,
+        size: v.size,
+        color: v.color,
+        colorHex: v.colorHex,
+      })),
+    },
+  });
 });
 
 /**
  * PATCH /api/admin/products/:id
- * admin only. Edits title/description/categoryId/basePrice — never the
+ * admin only. Edits title/description/category/basePrice — never the
  * slug, so existing product URLs never break out from under an edit.
- * Only the fields present in the body are updated.
  */
 export const updateProduct = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { title, description, categoryId, basePrice } = req.body;
 
-  const [existingRows] = await pool.execute('SELECT * FROM products WHERE id = ?', [id]);
-  const existing = existingRows[0];
-  if (!existing) throw ApiError.notFound('Product not found');
+  const product = await Product.findById(id);
+  if (!product) throw ApiError.notFound('Product not found');
 
   if (categoryId !== undefined) {
-    const [categoryRows] = await pool.execute('SELECT id FROM categories WHERE id = ?', [categoryId]);
-    if (categoryRows.length === 0) throw ApiError.badRequest('categoryId does not reference an existing category');
+    const category = await Category.findById(categoryId).lean();
+    if (!category) throw ApiError.badRequest('categoryId does not reference an existing category');
+    product.category = categoryId;
   }
 
-  const fields = [];
-  const params = [];
-  if (title !== undefined) {
-    fields.push('title = ?');
-    params.push(title);
-  }
-  if (description !== undefined) {
-    fields.push('description = ?');
-    params.push(description);
-  }
-  if (categoryId !== undefined) {
-    fields.push('category_id = ?');
-    params.push(categoryId);
-  }
-  if (basePrice !== undefined) {
-    fields.push('base_price = ?');
-    params.push(basePrice);
-  }
+  const before = {
+    title: product.title,
+    description: product.description,
+    categoryId: product.category?.toString(),
+    basePrice: product.basePrice,
+  };
 
-  await pool.execute(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`, [...params, id]);
+  if (title !== undefined) product.title = title;
+  if (description !== undefined) product.description = description;
+  if (basePrice !== undefined) product.basePrice = basePrice;
+  await product.save();
 
-  await logAudit(pool, {
+  await logAudit(null, {
     userId: req.user.id,
     action: 'product.updated',
     entityType: 'product',
-    entityId: Number(id),
-    before: { title: existing.title, description: existing.description, category_id: existing.category_id, base_price: existing.base_price },
+    entityId: id,
+    before,
     after: { title, description, categoryId, basePrice },
     ip: req.ip,
   });
 
-  res.json({ success: true, data: { id: Number(id) } });
+  res.json({ success: true, data: { id } });
 });
 
 /**
@@ -224,115 +199,89 @@ export const updateVariant = asyncHandler(async (req, res) => {
   const { id, variantId } = req.params;
   const { priceOverride, stockQuantity } = req.body;
 
-  const [existingRows] = await pool.execute(
-    'SELECT id, price_override, stock_quantity FROM product_variants WHERE id = ? AND product_id = ?',
-    [variantId, id]
-  );
-  const existing = existingRows[0];
-  if (!existing) throw ApiError.notFound('Variant not found');
+  const product = await Product.findById(id);
+  if (!product) throw ApiError.notFound('Variant not found');
 
-  const fields = [];
-  const params = [];
-  if (priceOverride !== undefined) {
-    fields.push('price_override = ?');
-    params.push(priceOverride);
-  }
-  if (stockQuantity !== undefined) {
-    fields.push('stock_quantity = ?');
-    params.push(stockQuantity);
-  }
+  const variant = product.variants.id(variantId);
+  if (!variant) throw ApiError.notFound('Variant not found');
 
-  await pool.execute(`UPDATE product_variants SET ${fields.join(', ')} WHERE id = ?`, [...params, variantId]);
+  const before = { priceOverride: variant.priceOverride, stockQuantity: variant.stockQuantity };
 
-  await logAudit(pool, {
+  if (priceOverride !== undefined) variant.priceOverride = priceOverride;
+  if (stockQuantity !== undefined) variant.stockQuantity = stockQuantity;
+  await product.save();
+
+  await logAudit(null, {
     userId: req.user.id,
     action: 'product_variant.updated',
     entityType: 'product_variant',
-    entityId: Number(variantId),
-    before: { priceOverride: existing.price_override, stockQuantity: existing.stock_quantity },
+    entityId: variantId,
+    before,
     after: { priceOverride, stockQuantity },
     ip: req.ip,
   });
 
-  res.json({ success: true, data: { id: Number(variantId) } });
+  res.json({ success: true, data: { id: variantId } });
 });
 
 /**
  * PATCH /api/admin/products/:id/status
- * admin only. Writes both `status` and the legacy `is_active` boolean —
- * the two are kept in sync per the products.status migration (see
- * backend/sql/migrations/001_add_product_status_up.sql); `is_active`
- * hasn't been dropped yet.
+ * admin only. draft/active/archived. (The legacy `is_active` boolean the
+ * SQL schema kept in sync alongside this doesn't exist in the document
+ * model — status is the only source of truth now.)
  */
 export const updateProductStatus = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
 
-  const [existingRows] = await pool.execute('SELECT id, status FROM products WHERE id = ?', [id]);
-  const existing = existingRows[0];
-  if (!existing) throw ApiError.notFound('Product not found');
+  const product = await Product.findById(id);
+  if (!product) throw ApiError.notFound('Product not found');
 
-  await pool.execute('UPDATE products SET status = ?, is_active = ? WHERE id = ?', [
-    status,
-    status === 'active',
-    id,
-  ]);
+  const before = { status: product.status };
+  product.status = status;
+  await product.save();
 
-  await logAudit(pool, {
+  await logAudit(null, {
     userId: req.user.id,
     action: 'product.status_changed',
     entityType: 'product',
-    entityId: Number(id),
-    before: { status: existing.status },
+    entityId: id,
+    before,
     after: { status },
     ip: req.ip,
   });
 
-  res.json({ success: true, data: { id: Number(id), status } });
+  res.json({ success: true, data: { id, status } });
 });
 
 /**
  * DELETE /api/admin/products/:id
- * admin only. A real hard delete — distinct from PATCH .../status with
- * 'archived', which is the everyday "remove from the store" action.
- * Allowed even for a product with order history (migration 012): every
- * order_items row already snapshots what was bought (title/sku/size/
- * color/price/qty) independent of the live variant, and nothing in the
- * app joins back through variant_id to render an order, so those orders
- * keep their full displayed detail — they just lose the live
- * back-reference (order_items.variant_id → NULL via ON DELETE SET NULL).
- * The order count is logged to audit_logs precisely because this is
- * capable of quietly detaching real sales history, so there's a durable
- * record of exactly what was deleted and when. Images and variants
- * cascade-delete automatically (both FKs are ON DELETE CASCADE from
- * products).
+ * admin only. A real hard delete, distinct from archiving. Allowed even
+ * for a product with order history: every order_items entry is a snapshot
+ * that renders without the product, so past orders keep their full
+ * detail and simply hold an id that no longer resolves — the same
+ * outcome MySQL's ON DELETE SET NULL produced. The order count is logged
+ * precisely because this can quietly detach real sales history.
  */
 export const deleteProduct = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  const [existingRows] = await pool.execute('SELECT id, title FROM products WHERE id = ?', [id]);
-  const existing = existingRows[0];
-  if (!existing) throw ApiError.notFound('Product not found');
+  const product = await Product.findById(id);
+  if (!product) throw ApiError.notFound('Product not found');
 
-  const [[{ orderCount }]] = await pool.execute(
-    `SELECT COUNT(DISTINCT oi.order_id) AS orderCount
-     FROM order_items oi
-     JOIN product_variants v ON v.id = oi.variant_id
-     WHERE v.product_id = ?`,
-    [id]
-  );
+  const orderCount = await Order.countDocuments({ 'items.productId': id });
 
-  await pool.execute('DELETE FROM products WHERE id = ?', [id]);
+  await Product.deleteOne({ _id: id });
 
-  await logAudit(pool, {
+  await logAudit(null, {
     userId: req.user.id,
     action: 'product.deleted',
     entityType: 'product',
-    entityId: Number(id),
-    before: { title: existing.title, orderCount },
+    entityId: id,
+    before: { title: product.title, orderCount },
     after: null,
     ip: req.ip,
   });
 
-  res.json({ success: true, data: { id: Number(id), orderCount } });
+  res.json({ success: true, data: { id, orderCount } });
 });

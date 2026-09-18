@@ -41,11 +41,29 @@ export function errorHandler(err, req, res, next) {
     return res.status(400).json({ success: false, message });
   }
 
-  // MySQL duplicate key (e.g. email/slug/sku already exists)
-  if (err.code === 'ER_DUP_ENTRY') {
+  // MongoDB duplicate key (unique index on email/slug/sku/orderNumber).
+  // Names the field so "SKU already in use" isn't a generic mystery.
+  if (err.code === 11000) {
+    const field = Object.keys(err.keyValue ?? err.keyPattern ?? {})[0];
+    const label = field ? field.split('.').pop() : null;
     return res.status(409).json({
       success: false,
-      message: 'A record with these details already exists',
+      message: label ? `That ${label} is already in use` : 'A record with these details already exists',
+    });
+  }
+
+  // A malformed ObjectId that slipped past validation (validators reject
+  // these up front, so this is a backstop) — a bad id is a 400, not a 500.
+  if (err.name === 'CastError') {
+    return res.status(400).json({ success: false, message: `Invalid ${err.path}` });
+  }
+
+  // Schema-level rule broken (e.g. negative stock, unknown enum value).
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({
+      success: false,
+      message: 'Validation failed',
+      details: Object.values(err.errors).map((e) => ({ path: e.path, message: e.message })),
     });
   }
 

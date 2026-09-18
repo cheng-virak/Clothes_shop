@@ -1,72 +1,81 @@
-import { pool, withTransaction } from '../../config/db.js';
+import { withTransaction } from '../../config/mongo.js';
+import { Category, Product, getSettings } from '../../models/index.js';
 import { ApiError } from '../../utils/ApiError.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { logAudit } from '../../utils/auditLog.js';
 
 const SORT_CLAUSES = {
-  stock_asc: 'v.stock_quantity ASC',
-  stock_desc: 'v.stock_quantity DESC',
+  stock_asc: { stock_quantity: 1, _id: 1 },
+  stock_desc: { stock_quantity: -1, _id: 1 },
 };
 
 /**
  * GET /api/admin/inventory
- * staff or admin. One row per VARIANT (not product) — a size/color combo
- * is what actually has a stock count. lowStock/outOfStock compare against
- * settings.low_stock_threshold (the one configured value, not a
- * per-variant column). Defaults to stock ascending — the point of this
- * screen is surfacing what's running out first.
+ * staff or admin. One row per VARIANT (not product) — a size/colour combo
+ * is what actually has a stock count, so the embedded variants are
+ * $unwind-ed into rows. lowStock/outOfStock compare against the single
+ * configured settings.lowStockThreshold. Defaults to stock ascending — the
+ * point of this screen is surfacing what's running out first.
  */
 export const listInventory = asyncHandler(async (req, res) => {
   const { lowStock, outOfStock, category, sort, page, limit } = req.query;
+  const { lowStockThreshold } = await getSettings();
 
-  const [[{ low_stock_threshold: lowStockThreshold }]] = await pool.execute(
-    'SELECT low_stock_threshold FROM settings WHERE id = 1'
-  );
-
-  const where = [];
-  const params = [];
-  if (outOfStock) {
-    where.push('v.stock_quantity = 0');
-  } else if (lowStock) {
-    where.push('v.stock_quantity <= ?');
-    params.push(lowStockThreshold);
-  }
+  const productMatch = {};
   if (category) {
-    where.push('c.slug = ?');
-    params.push(category);
+    const categoryDoc = await Category.findOne({ slug: category }).select('_id').lean();
+    productMatch.category = categoryDoc ? categoryDoc._id : null;
   }
-  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const orderByClause = SORT_CLAUSES[sort] ?? SORT_CLAUSES.stock_asc;
 
-  const [countRows] = await pool.execute(
-    `SELECT COUNT(*) AS total
-     FROM product_variants v
-     JOIN products p ON p.id = v.product_id
-     JOIN categories c ON c.id = p.category_id
-     ${whereClause}`,
-    params
-  );
-  const total = countRows[0].total;
-  const offset = (page - 1) * limit;
+  const variantMatch = {};
+  if (outOfStock) variantMatch.stock_quantity = 0;
+  else if (lowStock) variantMatch.stock_quantity = { $lte: lowStockThreshold };
 
-  const [rows] = await pool.execute(
-    `SELECT v.id AS variant_id, p.id AS product_id, p.title AS product_title,
-            c.name AS category_name, c.slug AS category_slug,
-            s.code AS size, col.name AS color, v.sku, v.stock_quantity
-     FROM product_variants v
-     JOIN products p ON p.id = v.product_id
-     JOIN categories c ON c.id = p.category_id
-     JOIN sizes s ON s.id = v.size_id
-     JOIN colors col ON col.id = v.color_id
-     ${whereClause}
-     ORDER BY ${orderByClause}
-     LIMIT ${Number(limit)} OFFSET ${Number(offset)}`,
-    params
-  );
+  const rowsPipeline = [
+    { $match: productMatch },
+    { $unwind: '$variants' },
+    {
+      $project: {
+        variant_id: '$variants._id',
+        product_id: '$_id',
+        product_title: '$title',
+        category: 1,
+        size: '$variants.size',
+        color: '$variants.color',
+        sku: '$variants.sku',
+        stock_quantity: '$variants.stockQuantity',
+      },
+    },
+    { $match: variantMatch },
+  ];
+
+  const [countResult] = await Product.aggregate([...rowsPipeline, { $count: 'total' }]);
+  const total = countResult?.total ?? 0;
+
+  const rows = await Product.aggregate([
+    ...rowsPipeline,
+    { $sort: SORT_CLAUSES[sort] ?? SORT_CLAUSES.stock_asc },
+    { $skip: (page - 1) * limit },
+    { $limit: limit },
+    { $lookup: { from: 'categories', localField: 'category', foreignField: '_id', as: 'categoryDoc' } },
+    { $unwind: { path: '$categoryDoc', preserveNullAndEmptyArrays: true } },
+  ]);
+
+  const data = rows.map((r) => ({
+    variant_id: r.variant_id.toString(),
+    product_id: r.product_id.toString(),
+    product_title: r.product_title,
+    category_name: r.categoryDoc?.name ?? null,
+    category_slug: r.categoryDoc?.slug ?? null,
+    size: r.size,
+    color: r.color,
+    sku: r.sku,
+    stock_quantity: r.stock_quantity,
+  }));
 
   res.json({
     success: true,
-    data: rows,
+    data,
     meta: { page, limit, total, totalPages: Math.ceil(total / limit), lowStockThreshold },
   });
 });
@@ -80,79 +89,71 @@ export const listInventory = asyncHandler(async (req, res) => {
 export const previewImport = asyncHandler(async (req, res) => {
   const { rows } = req.body;
 
-  const results = [];
-  for (const row of rows) {
-    const [variantRows] = await pool.execute(
-      `SELECT v.id AS variant_id, v.stock_quantity, p.title AS product_title, s.code AS size, col.name AS color
-       FROM product_variants v
-       JOIN products p ON p.id = v.product_id
-       JOIN sizes s ON s.id = v.size_id
-       JOIN colors col ON col.id = v.color_id
-       WHERE v.sku = ?
-       LIMIT 1`,
-      [row.sku]
-    );
-    const variant = variantRows[0];
-    if (!variant) {
-      results.push({ sku: row.sku, found: false, newStock: row.stockQuantity });
-      continue;
+  const products = await Product.find({ 'variants.sku': { $in: rows.map((r) => r.sku) } }).lean();
+  const bySku = new Map();
+  for (const product of products) {
+    for (const variant of product.variants) {
+      bySku.set(variant.sku, { product, variant });
     }
-    results.push({
+  }
+
+  const results = rows.map((row) => {
+    const hit = bySku.get(row.sku);
+    if (!hit) return { sku: row.sku, found: false, newStock: row.stockQuantity };
+    return {
       sku: row.sku,
       found: true,
-      variantId: variant.variant_id,
-      productTitle: variant.product_title,
-      size: variant.size,
-      color: variant.color,
-      currentStock: variant.stock_quantity,
+      variantId: hit.variant._id.toString(),
+      productTitle: hit.product.title,
+      size: hit.variant.size,
+      color: hit.variant.color,
+      currentStock: hit.variant.stockQuantity,
       newStock: row.stockQuantity,
-      delta: row.stockQuantity - variant.stock_quantity,
-    });
-  }
+      delta: row.stockQuantity - hit.variant.stockQuantity,
+    };
+  });
 
   res.json({ success: true, data: results });
 });
 
 /**
  * POST /api/admin/inventory/import/apply
- * staff or admin. Re-validates every SKU fresh (never trusts the preview
- * response, which could be stale by the time the admin confirms) inside
- * ONE transaction — any unknown SKU aborts the whole import, so it's all
- * rows or none, never a partial apply. Each row's before/after stock is
- * written to audit_logs individually.
+ * staff or admin. Re-validates every SKU fresh (never trusts the preview,
+ * which could be stale by the time the admin confirms) inside ONE
+ * transaction — any unknown SKU aborts the whole import, so it's all rows
+ * or none. Each row's before/after stock is audit-logged individually.
  */
 export const applyImport = asyncHandler(async (req, res) => {
   const { rows } = req.body;
   const actorUserId = req.user.id;
 
-  const changes = await withTransaction(async (conn) => {
+  const changes = await withTransaction(async (session) => {
     const applied = [];
     for (const row of rows) {
-      const [variantRows] = await conn.execute(
-        'SELECT id, stock_quantity FROM product_variants WHERE sku = ? FOR UPDATE',
-        [row.sku]
-      );
-      const variant = variantRows[0];
+      const product = await Product.findOne({ 'variants.sku': row.sku }).session(session);
+      const variant = product?.variants.find((v) => v.sku === row.sku);
       if (!variant) {
         throw ApiError.badRequest(`Unknown SKU: ${row.sku} — import aborted, nothing was changed`);
       }
 
-      await conn.execute('UPDATE product_variants SET stock_quantity = ? WHERE id = ?', [
-        row.stockQuantity,
-        variant.id,
-      ]);
+      const before = variant.stockQuantity;
+      await Product.updateOne(
+        { _id: product._id, 'variants._id': variant._id },
+        { $set: { 'variants.$.stockQuantity': row.stockQuantity } },
+        { session }
+      );
 
-      await logAudit(conn, {
+      await logAudit(session, {
         userId: actorUserId,
         action: 'inventory.stock_imported',
         entityType: 'product_variant',
-        entityId: variant.id,
-        before: { stockQuantity: variant.stock_quantity },
+        entityId: variant._id.toString(),
+        before: { stockQuantity: before },
         after: { stockQuantity: row.stockQuantity },
         ip: req.ip,
       });
 
-      applied.push({ sku: row.sku, variantId: variant.id, from: variant.stock_quantity, to: row.stockQuantity });
+      applied.push({ sku: row.sku, variantId: variant._id.toString(), from: before, to: row.stockQuantity });
     }
     return applied;
   });

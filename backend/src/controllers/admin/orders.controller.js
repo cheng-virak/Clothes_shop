@@ -1,14 +1,15 @@
-import { pool, withTransaction } from '../../config/db.js';
+import { withTransaction } from '../../config/mongo.js';
+import { Order, Product, User } from '../../models/index.js';
 import { ApiError } from '../../utils/ApiError.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { logAudit } from '../../utils/auditLog.js';
 import { isLegalOrderTransition, STOCK_RESTORING_TRANSITIONS } from '@shope/shared/orderStatus';
 
 const SORT_CLAUSES = {
-  newest: 'o.placed_at DESC',
-  oldest: 'o.placed_at ASC',
-  total_desc: 'o.grand_total DESC',
-  total_asc: 'o.grand_total ASC',
+  newest: { placedAt: -1 },
+  oldest: { placedAt: 1 },
+  total_desc: { grandTotal: -1 },
+  total_asc: { grandTotal: 1 },
 };
 
 /**
@@ -19,129 +20,160 @@ const SORT_CLAUSES = {
 export const listOrders = asyncHandler(async (req, res) => {
   const { status, q, from, to, page, limit, sort } = req.query;
 
-  const where = [];
-  const params = [];
-
-  if (status) {
-    where.push('o.order_status = ?');
-    params.push(status);
+  const filter = {};
+  if (status) filter.orderStatus = status;
+  if (from || to) {
+    filter.placedAt = {};
+    if (from) filter.placedAt.$gte = new Date(from);
+    // `to` is an inclusive day in the UI, so match up to the end of it.
+    if (to) filter.placedAt.$lt = new Date(new Date(to).getTime() + 24 * 60 * 60 * 1000);
   }
+
   if (q) {
-    where.push('(o.order_number LIKE ? OR u.email LIKE ? OR u.full_name LIKE ?)');
-    const like = `%${q}%`;
-    params.push(like, like, like);
-  }
-  if (from) {
-    where.push('o.placed_at >= ?');
-    params.push(from);
-  }
-  if (to) {
-    where.push('o.placed_at < DATE_ADD(?, INTERVAL 1 DAY)');
-    params.push(to);
+    const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rx = new RegExp(safe, 'i');
+    // Customer name/email live on the user document, so they're resolved
+    // to ids first — the SQL version got this from a JOIN.
+    const users = await User.find({ $or: [{ email: rx }, { fullName: rx }] }).select('_id').lean();
+    filter.$or = [{ orderNumber: rx }, { user: { $in: users.map((u) => u._id) } }];
   }
 
-  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const orderByClause = SORT_CLAUSES[sort] ?? SORT_CLAUSES.newest;
+  const skip = (page - 1) * limit;
 
-  const [countRows] = await pool.execute(
-    `SELECT COUNT(*) AS total FROM orders o JOIN users u ON u.id = o.user_id ${whereClause}`,
-    params
-  );
-  const total = countRows[0].total;
-  const offset = (page - 1) * limit;
+  const [orders, total] = await Promise.all([
+    Order.find(filter)
+      .populate('user', 'fullName email')
+      .sort(SORT_CLAUSES[sort] ?? SORT_CLAUSES.newest)
+      .skip(skip)
+      .limit(limit)
+      .lean(),
+    Order.countDocuments(filter),
+  ]);
 
-  const [rows] = await pool.execute(
-    `SELECT
-       o.id, o.order_number, o.placed_at, o.grand_total, o.payment_status, o.order_status,
-       u.full_name AS customer_name, u.email AS customer_email,
-       (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count
-     FROM orders o
-     JOIN users u ON u.id = o.user_id
-     ${whereClause}
-     ORDER BY ${orderByClause}
-     LIMIT ${Number(limit)} OFFSET ${Number(offset)}`,
-    params
-  );
+  const data = orders.map((o) => ({
+    id: o._id.toString(),
+    order_number: o.orderNumber,
+    placed_at: o.placedAt,
+    grand_total: o.grandTotal,
+    payment_status: o.paymentStatus,
+    order_status: o.orderStatus,
+    customer_name: o.user?.fullName ?? null,
+    customer_email: o.user?.email ?? null,
+    item_count: o.items.length,
+  }));
 
   res.json({
     success: true,
-    data: rows,
+    data,
     meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
   });
 });
 
 /**
  * GET /api/admin/orders/:id
- * staff or admin. Items come from the order_items SNAPSHOT — never
- * re-joined to live products/variants, since price/title can have
- * changed since the order was placed (see order.controller.js's
- * createOrder, which writes the snapshot at order time).
+ * staff or admin. Items come from the embedded SNAPSHOT — never re-read
+ * from the live product, since price/title can have changed since the
+ * order was placed.
  */
 export const getOrder = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  const [orderRows] = await pool.execute(
-    `SELECT o.*, u.full_name AS customer_name, u.email AS customer_email, u.phone AS customer_phone
-     FROM orders o
-     JOIN users u ON u.id = o.user_id
-     WHERE o.id = ?
-     LIMIT 1`,
-    [id]
-  );
-  const order = orderRows[0];
+  const order = await Order.findById(id).populate('user', 'fullName email phone').lean();
   if (!order) throw ApiError.notFound('Order not found');
 
-  const [items] = await pool.execute(
-    `SELECT id, variant_id, product_title, sku, size_code, color_name, unit_price, quantity, line_total
-     FROM order_items WHERE order_id = ?`,
-    [id]
-  );
+  const changedByIds = order.statusHistory.map((h) => h.changedBy).filter(Boolean);
+  const actors = await User.find({ _id: { $in: changedByIds } }).select('fullName').lean();
+  const actorNames = new Map(actors.map((a) => [a._id.toString(), a.fullName]));
 
-  const [history] = await pool.execute(
-    `SELECT h.id, h.status, h.note, h.changed_at, u.full_name AS changed_by_name
-     FROM order_status_history h
-     LEFT JOIN users u ON u.id = h.changed_by_user_id
-     WHERE h.order_id = ?
-     ORDER BY h.changed_at ASC`,
-    [id]
-  );
+  const otherOrders = await Order.find({ user: order.user?._id, _id: { $ne: order._id } })
+    .sort({ placedAt: -1 })
+    .limit(10)
+    .lean();
 
-  const [otherOrders] = await pool.execute(
-    `SELECT id, order_number, placed_at, grand_total, order_status
-     FROM orders WHERE user_id = ? AND id != ?
-     ORDER BY placed_at DESC LIMIT 10`,
-    [order.user_id, id]
-  );
-
-  res.json({ success: true, data: { ...order, items, statusHistory: history, otherOrdersByCustomer: otherOrders } });
+  res.json({
+    success: true,
+    data: {
+      id: order._id.toString(),
+      order_number: order.orderNumber,
+      placed_at: order.placedAt,
+      order_status: order.orderStatus,
+      payment_status: order.paymentStatus,
+      payment_method: order.paymentMethod,
+      subtotal: order.subtotal,
+      shipping_fee: order.shippingFee,
+      discount_total: order.discountTotal,
+      tax_total: order.taxTotal,
+      grand_total: order.grandTotal,
+      tracking_number: order.trackingNumber,
+      tracking_carrier: order.trackingCarrier,
+      customer_name: order.user?.fullName ?? null,
+      customer_email: order.user?.email ?? null,
+      customer_phone: order.user?.phone ?? null,
+      shipping_name: order.shipping.name,
+      shipping_phone: order.shipping.phone,
+      shipping_line1: order.shipping.line1,
+      shipping_line2: order.shipping.line2,
+      shipping_city: order.shipping.city,
+      shipping_state: order.shipping.state,
+      shipping_postal: order.shipping.postal,
+      shipping_country: order.shipping.country,
+      items: order.items.map((i) => ({
+        id: i._id.toString(),
+        variant_id: i.variantId ? i.variantId.toString() : null,
+        product_title: i.productTitle,
+        sku: i.sku,
+        size_code: i.sizeCode,
+        color_name: i.colorName,
+        unit_price: i.unitPrice,
+        quantity: i.quantity,
+        line_total: i.lineTotal,
+      })),
+      statusHistory: order.statusHistory.map((h) => ({
+        id: h._id.toString(),
+        status: h.status,
+        note: h.note,
+        changed_at: h.changedAt,
+        changed_by_name: h.changedBy ? actorNames.get(h.changedBy.toString()) ?? null : null,
+      })),
+      otherOrdersByCustomer: otherOrders.map((o) => ({
+        id: o._id.toString(),
+        order_number: o.orderNumber,
+        placed_at: o.placedAt,
+        grand_total: o.grandTotal,
+        order_status: o.orderStatus,
+      })),
+    },
+  });
 });
 
 /**
  * PATCH /api/admin/orders/:id/status
  * staff or admin. Enforces the state machine server-side (see
  * shared/src/orderStatus.js) — the UI greying out illegal buttons is
- * convenience only. Row-locked (FOR UPDATE) inside one transaction so two
- * concurrent requests can't both read "pending" and both restock; the
- * second one sees the already-applied status and takes the idempotent
- * no-op path instead of double-restocking or erroring.
+ * convenience only.
+ *
+ * The double-restock race that SELECT ... FOR UPDATE guarded in MySQL is
+ * handled here by making the status write itself conditional: the update
+ * only matches while the order is still in the status we read, so of two
+ * concurrent cancels exactly one matches and restores stock. The other
+ * finds the order already cancelled and takes the idempotent no-op path.
  */
 export const updateOrderStatus = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { status: nextStatus, note } = req.body;
   const actorUserId = req.user.id;
 
-  const result = await withTransaction(async (conn) => {
-    const [orderRows] = await conn.execute('SELECT id, order_status FROM orders WHERE id = ? FOR UPDATE', [id]);
-    const order = orderRows[0];
+  const result = await withTransaction(async (session) => {
+    const order = await Order.findById(id).session(session);
     if (!order) throw ApiError.notFound('Order not found');
 
-    const currentStatus = order.order_status;
+    const currentStatus = order.orderStatus;
 
     // Idempotent: re-applying the status the order is ALREADY at succeeds
     // as a no-op rather than erroring — a double-click or a retried
     // request lands here instead of a false "illegal transition".
     if (currentStatus === nextStatus) {
-      return { id: order.id, status: currentStatus, changed: false };
+      return { id: order._id.toString(), status: currentStatus, changed: false };
     }
 
     if (!isLegalOrderTransition(currentStatus, nextStatus)) {
@@ -152,38 +184,46 @@ export const updateOrderStatus = asyncHandler(async (req, res) => {
     }
 
     const shouldRestoreStock = STOCK_RESTORING_TRANSITIONS[nextStatus]?.includes(currentStatus) ?? false;
+
+    // Conditional on the status we just read — this is the concurrency
+    // guard, not the findById above.
+    const applied = await Order.updateOne(
+      { _id: order._id, orderStatus: currentStatus },
+      {
+        $set: { orderStatus: nextStatus },
+        $push: { statusHistory: { status: nextStatus, note: note ?? null, changedBy: actorUserId } },
+      },
+      { session }
+    );
+    if (applied.modifiedCount !== 1) {
+      throw ApiError.conflict('Order status changed concurrently — reload and try again');
+    }
+
     if (shouldRestoreStock) {
-      const [items] = await conn.execute('SELECT variant_id, quantity FROM order_items WHERE order_id = ?', [id]);
-      for (const item of items) {
-        // variant_id is NULL when the product was hard-deleted since this
-        // order was placed (migration 012) — there's no live variant row
-        // left to restore stock to, so this is correctly a no-op rather
-        // than an error.
-        if (item.variant_id === null) continue;
-        await conn.execute('UPDATE product_variants SET stock_quantity = stock_quantity + ? WHERE id = ?', [
-          item.quantity,
-          item.variant_id,
-        ]);
+      for (const item of order.items) {
+        // null when the product was hard-deleted since the order was
+        // placed — there's no live variant to restore stock to, so this
+        // is correctly a no-op rather than an error.
+        if (!item.variantId || !item.productId) continue;
+        await Product.updateOne(
+          { _id: item.productId, 'variants._id': item.variantId },
+          { $inc: { 'variants.$.stockQuantity': item.quantity } },
+          { session }
+        );
       }
     }
 
-    await conn.execute('UPDATE orders SET order_status = ? WHERE id = ?', [nextStatus, id]);
-    await conn.execute(
-      `INSERT INTO order_status_history (order_id, changed_by_user_id, status, note)
-       VALUES (?, ?, ?, ?)`,
-      [id, actorUserId, nextStatus, note ?? null]
-    );
-    await logAudit(conn, {
+    await logAudit(session, {
       userId: actorUserId,
       action: 'order.status_changed',
       entityType: 'order',
-      entityId: Number(id),
+      entityId: order._id.toString(),
       before: { status: currentStatus },
       after: { status: nextStatus, note: note ?? null, stockRestored: shouldRestoreStock },
       ip: req.ip,
     });
 
-    return { id: order.id, status: nextStatus, changed: true, stockRestored: shouldRestoreStock };
+    return { id: order._id.toString(), status: nextStatus, changed: true, stockRestored: shouldRestoreStock };
   });
 
   res.json({ success: true, data: result });

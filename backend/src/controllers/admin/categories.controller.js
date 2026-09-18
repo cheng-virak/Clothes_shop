@@ -1,4 +1,4 @@
-import { pool } from '../../config/db.js';
+import { Category, Product } from '../../models/index.js';
 import { ApiError } from '../../utils/ApiError.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { logAudit } from '../../utils/auditLog.js';
@@ -12,16 +12,12 @@ function slugify(name) {
 }
 
 async function isSlugTaken(slug, excludeId) {
-  const params = excludeId ? [slug, excludeId] : [slug];
-  const [rows] = await pool.execute(
-    `SELECT id FROM categories WHERE slug = ? ${excludeId ? 'AND id != ?' : ''} LIMIT 1`,
-    params
-  );
-  return rows.length > 0;
+  const filter = excludeId ? { slug, _id: { $ne: excludeId } } : { slug };
+  return Boolean(await Category.exists(filter));
 }
 
-/** Appends -2, -3, ... until unique, so a name collision (e.g. two
- *  categories both named "Tops") never blocks creation on its own. */
+/** Appends -2, -3, ... until unique, so a slug collision never blocks
+ *  creation on its own. */
 async function generateUniqueSlug(name) {
   const base = slugify(name) || 'category';
   let candidate = base;
@@ -35,229 +31,215 @@ async function generateUniqueSlug(name) {
 
 /**
  * GET /api/admin/categories
- * admin only. Flat list (the tree has only one level, so a flat list with
- * parent_id/parent_name is enough for the UI to group it) with a real SQL
- * product count per category — never counted in JS.
+ * admin only. Flat list (the tree is one level deep, so parent_id is
+ * enough for the UI to group it) with product and child counts computed
+ * in the database, never by counting in JS.
  */
 export const listCategories = asyncHandler(async (req, res) => {
-  const [rows] = await pool.execute(
-    `SELECT c.id, c.name, c.slug, c.parent_id, p.name AS parent_name, c.image_url, c.sort_order,
-            (SELECT COUNT(*) FROM products pr WHERE pr.category_id = c.id) AS product_count,
-            (SELECT COUNT(*) FROM categories child WHERE child.parent_id = c.id) AS child_count
-     FROM categories c
-     LEFT JOIN categories p ON p.id = c.parent_id
-     ORDER BY c.parent_id IS NOT NULL, c.sort_order ASC, c.name ASC`
-  );
-  res.json({ success: true, data: rows });
+  const [categories, productCounts, childCounts] = await Promise.all([
+    Category.find().populate('parent', 'name').lean(),
+    Product.aggregate([{ $group: { _id: '$category', n: { $sum: 1 } } }]),
+    Category.aggregate([{ $match: { parent: { $ne: null } } }, { $group: { _id: '$parent', n: { $sum: 1 } } }]),
+  ]);
+
+  const productsBy = new Map(productCounts.map((r) => [String(r._id), r.n]));
+  const childrenBy = new Map(childCounts.map((r) => [String(r._id), r.n]));
+
+  const data = categories
+    .map((c) => ({
+      id: c._id.toString(),
+      name: c.name,
+      slug: c.slug,
+      parent_id: c.parent ? c.parent._id.toString() : null,
+      parent_name: c.parent?.name ?? null,
+      image_url: c.imageUrl,
+      sort_order: c.sortOrder,
+      product_count: productsBy.get(c._id.toString()) ?? 0,
+      child_count: childrenBy.get(c._id.toString()) ?? 0,
+    }))
+    // Top-level first, then by sort order — same as the SQL ORDER BY.
+    .sort((a, b) => {
+      if (!a.parent_id && b.parent_id) return -1;
+      if (a.parent_id && !b.parent_id) return 1;
+      return a.sort_order - b.sort_order || a.name.localeCompare(b.name);
+    });
+
+  res.json({ success: true, data });
 });
 
 /**
  * GET /api/admin/categories/check-slug?slug=...&excludeId=...
- * admin only. Backs the live uniqueness check in the create/rename form.
- * excludeId lets a category check its own current slug without colliding
- * with itself (not used today since slug is immutable post-creation, but
- * the endpoint is written to support it either way).
+ * admin only. Backs the live uniqueness check in the create form.
  */
 export const checkSlug = asyncHandler(async (req, res) => {
   const { slug, excludeId } = req.query;
-  const taken = await isSlugTaken(slugify(slug), excludeId);
-  res.json({ success: true, data: { slug: slugify(slug), available: !taken } });
+  const normalised = slugify(slug);
+  const taken = await isSlugTaken(normalised, excludeId);
+  res.json({ success: true, data: { slug: normalised, available: !taken } });
 });
+
+/** Mongo has no foreign keys, so the one-level-of-nesting rule the SQL
+ *  version checked alongside its FK now lives entirely here. */
+async function assertValidParent(parentId, selfId) {
+  if (selfId && String(parentId) === String(selfId)) {
+    throw ApiError.badRequest('A category cannot be its own parent');
+  }
+  const parent = await Category.findById(parentId).lean();
+  if (!parent) throw ApiError.badRequest('parentId does not reference an existing category');
+  if (parent.parent) {
+    throw ApiError.badRequest('Only one level of nesting is supported — the chosen parent is itself a child category');
+  }
+}
 
 /**
  * POST /api/admin/categories
- * admin only. Slug is generated from the name server-side (never trusts a
- * client-supplied slug) and de-duped automatically. parentId, if given,
- * must reference a TOP-LEVEL category — the schema/UI only support one
- * level of nesting, so a category cannot be created as a grandchild.
+ * admin only. Slug is generated server-side (never trusted from the
+ * client) and de-duplicated automatically.
  */
 export const createCategory = asyncHandler(async (req, res) => {
   const { name, parentId, imageUrl } = req.body;
 
-  // Checked explicitly (rather than letting the UNIQUE constraint on
-  // categories.name surface as a generic "record already exists" error)
-  // so the admin sees exactly what collided.
-  const [nameRows] = await pool.execute('SELECT id FROM categories WHERE name = ?', [name]);
-  if (nameRows.length > 0) {
+  if (await Category.exists({ name })) {
     throw ApiError.conflict(`A category named "${name}" already exists`);
   }
-
-  if (parentId) {
-    const [parentRows] = await pool.execute('SELECT id, parent_id FROM categories WHERE id = ?', [parentId]);
-    const parent = parentRows[0];
-    if (!parent) throw ApiError.badRequest('parentId does not reference an existing category');
-    if (parent.parent_id !== null) {
-      throw ApiError.badRequest('Only one level of nesting is supported — the chosen parent is itself a child category');
-    }
-  }
+  if (parentId) await assertValidParent(parentId);
 
   const slug = await generateUniqueSlug(name);
-  const [[{ maxSort }]] = await pool.execute(
-    'SELECT COALESCE(MAX(sort_order), 0) AS maxSort FROM categories WHERE parent_id <=> ?',
-    [parentId ?? null]
-  );
+  const last = await Category.findOne({ parent: parentId ?? null }).sort({ sortOrder: -1 }).lean();
 
-  const [result] = await pool.execute(
-    'INSERT INTO categories (name, slug, parent_id, image_url, sort_order) VALUES (?, ?, ?, ?, ?)',
-    [name, slug, parentId ?? null, imageUrl ?? null, maxSort + 1]
-  );
+  const category = await Category.create({
+    name,
+    slug,
+    parent: parentId ?? null,
+    imageUrl: imageUrl ?? null,
+    sortOrder: (last?.sortOrder ?? 0) + 1,
+  });
 
-  await logAudit(pool, {
+  await logAudit(null, {
     userId: req.user.id,
     action: 'category.created',
     entityType: 'category',
-    entityId: result.insertId,
+    entityId: category._id.toString(),
     before: null,
     after: { name, slug, parentId: parentId ?? null, imageUrl: imageUrl ?? null },
     ip: req.ip,
   });
 
-  res.status(201).json({ success: true, data: { id: result.insertId, slug } });
+  res.status(201).json({ success: true, data: { id: category._id.toString(), slug } });
 });
 
 /**
  * PATCH /api/admin/categories/:id
- * admin only. Rename / change parent / change image — never the slug (see
- * the validator's comment). Refuses anything that would create a second
- * level of nesting: making this category a child of a non-top-level
- * category, self-parenting, or giving a parent to a category that
- * currently has children of its own.
+ * admin only. Rename / change parent / change image — never the slug.
+ * Refuses anything that would create a second level of nesting.
  */
 export const updateCategory = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { name, parentId, imageUrl } = req.body;
 
-  const [existingRows] = await pool.execute('SELECT * FROM categories WHERE id = ?', [id]);
-  const existing = existingRows[0];
-  if (!existing) throw ApiError.notFound('Category not found');
+  const category = await Category.findById(id);
+  if (!category) throw ApiError.notFound('Category not found');
 
-  if (name !== undefined && name !== existing.name) {
-    const [nameRows] = await pool.execute('SELECT id FROM categories WHERE name = ? AND id != ?', [name, id]);
-    if (nameRows.length > 0) {
+  if (name !== undefined && name !== category.name) {
+    if (await Category.exists({ name, _id: { $ne: id } })) {
       throw ApiError.conflict(`A category named "${name}" already exists`);
     }
   }
 
-  if (parentId !== undefined && parentId !== null) {
-    if (Number(parentId) === Number(id)) {
-      throw ApiError.badRequest('A category cannot be its own parent');
-    }
-    const [parentRows] = await pool.execute('SELECT id, parent_id FROM categories WHERE id = ?', [parentId]);
-    const parent = parentRows[0];
-    if (!parent) throw ApiError.badRequest('parentId does not reference an existing category');
-    if (parent.parent_id !== null) {
-      throw ApiError.badRequest('Only one level of nesting is supported — the chosen parent is itself a child category');
-    }
-    const [[{ childCount }]] = await pool.execute(
-      'SELECT COUNT(*) AS childCount FROM categories WHERE parent_id = ?',
-      [id]
-    );
-    if (childCount > 0) {
-      throw ApiError.badRequest('This category has its own child categories — it cannot also become a child (that would create a third level)');
+  if (parentId) {
+    await assertValidParent(parentId, id);
+    if (await Category.exists({ parent: id })) {
+      throw ApiError.badRequest(
+        'This category has its own child categories — it cannot also become a child (that would create a third level)'
+      );
     }
   }
 
-  const fields = [];
-  const params = [];
-  if (name !== undefined) {
-    fields.push('name = ?');
-    params.push(name);
-  }
-  if (parentId !== undefined) {
-    fields.push('parent_id = ?');
-    params.push(parentId);
-  }
-  if (imageUrl !== undefined) {
-    fields.push('image_url = ?');
-    params.push(imageUrl);
-  }
+  const before = { name: category.name, parentId: category.parent?.toString() ?? null, imageUrl: category.imageUrl };
 
-  await pool.execute(`UPDATE categories SET ${fields.join(', ')} WHERE id = ?`, [...params, id]);
+  if (name !== undefined) category.name = name;
+  if (parentId !== undefined) category.parent = parentId;
+  if (imageUrl !== undefined) category.imageUrl = imageUrl;
+  await category.save();
 
-  await logAudit(pool, {
+  await logAudit(null, {
     userId: req.user.id,
     action: 'category.updated',
     entityType: 'category',
-    entityId: Number(id),
-    before: { name: existing.name, parentId: existing.parent_id, imageUrl: existing.image_url },
+    entityId: id,
+    before,
     after: { name, parentId, imageUrl },
     ip: req.ip,
   });
 
-  res.json({ success: true, data: { id: Number(id) } });
+  res.json({ success: true, data: { id } });
 });
 
 /**
  * PATCH /api/admin/categories/:id/reorder
- * admin only. Swaps sort_order with the adjacent sibling (same parent_id)
- * rather than exposing a raw sort_order for the client to set arbitrarily
- * — simple up/down arrows in the UI, no drag-and-drop dependency needed.
+ * admin only. Swaps sortOrder with the adjacent sibling (same parent).
  */
 export const reorderCategory = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { direction } = req.body;
 
-  const [rows] = await pool.execute('SELECT id, parent_id, sort_order FROM categories WHERE id = ?', [id]);
-  const category = rows[0];
+  const category = await Category.findById(id);
   if (!category) throw ApiError.notFound('Category not found');
 
-  const comparator = direction === 'up' ? '<' : '>';
-  const orderBy = direction === 'up' ? 'sort_order DESC' : 'sort_order ASC';
+  const sibling = await Category.findOne({
+    parent: category.parent,
+    sortOrder: direction === 'up' ? { $lt: category.sortOrder } : { $gt: category.sortOrder },
+  }).sort({ sortOrder: direction === 'up' ? -1 : 1 });
 
-  const [siblingRows] = await pool.execute(
-    `SELECT id, sort_order FROM categories
-     WHERE parent_id <=> ? AND sort_order ${comparator} ?
-     ORDER BY ${orderBy}
-     LIMIT 1`,
-    [category.parent_id, category.sort_order]
-  );
-  const sibling = siblingRows[0];
   if (!sibling) {
-    return res.json({ success: true, data: { id: Number(id), moved: false } });
+    return res.json({ success: true, data: { id, moved: false } });
   }
 
-  await pool.execute('UPDATE categories SET sort_order = ? WHERE id = ?', [sibling.sort_order, id]);
-  await pool.execute('UPDATE categories SET sort_order = ? WHERE id = ?', [category.sort_order, sibling.id]);
+  const own = category.sortOrder;
+  category.sortOrder = sibling.sortOrder;
+  sibling.sortOrder = own;
+  await Promise.all([category.save(), sibling.save()]);
 
-  res.json({ success: true, data: { id: Number(id), moved: true } });
+  res.json({ success: true, data: { id, moved: true } });
 });
 
 /**
  * DELETE /api/admin/categories/:id
- * admin only. Refused (409, not the raw FK error) if any product still
- * references this category — names the count so the admin can act on it.
- * A category with children is allowed to be deleted; its children become
- * top-level (parent_id NULL) via the FK's ON DELETE SET NULL, matching
- * the schema's existing behavior.
+ * admin only. Both behaviours MySQL's foreign keys used to provide are
+ * reproduced here explicitly:
+ *   - ON DELETE RESTRICT on products.category_id -> refused (409, naming
+ *     the count) while any product still uses this category.
+ *   - ON DELETE SET NULL on categories.parent_id -> its children become
+ *     top-level rather than being orphaned.
  */
 export const deleteCategory = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  const [existingRows] = await pool.execute('SELECT * FROM categories WHERE id = ?', [id]);
-  const existing = existingRows[0];
-  if (!existing) throw ApiError.notFound('Category not found');
+  const category = await Category.findById(id).lean();
+  if (!category) throw ApiError.notFound('Category not found');
 
-  const [[{ productCount }]] = await pool.execute('SELECT COUNT(*) AS productCount FROM products WHERE category_id = ?', [
-    id,
-  ]);
+  const productCount = await Product.countDocuments({ category: id });
   if (productCount > 0) {
     throw ApiError.conflict(
-      `${productCount} product${productCount === 1 ? '' : 's'} use this category — move ${productCount === 1 ? 'it' : 'them'} to another category first`,
+      `${productCount} product${productCount === 1 ? '' : 's'} use this category — move ${
+        productCount === 1 ? 'it' : 'them'
+      } to another category first`,
       { productCount }
     );
   }
 
-  await pool.execute('DELETE FROM categories WHERE id = ?', [id]);
+  await Category.updateMany({ parent: id }, { $set: { parent: null } });
+  await Category.deleteOne({ _id: id });
 
-  await logAudit(pool, {
+  await logAudit(null, {
     userId: req.user.id,
     action: 'category.deleted',
     entityType: 'category',
-    entityId: Number(id),
-    before: { name: existing.name, slug: existing.slug },
+    entityId: id,
+    before: { name: category.name, slug: category.slug },
     after: null,
     ip: req.ip,
   });
 
-  res.json({ success: true, data: { id: Number(id) } });
+  res.json({ success: true, data: { id } });
 });

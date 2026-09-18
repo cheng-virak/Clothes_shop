@@ -1,23 +1,30 @@
+import { AuditLog } from '../models/index.js';
+
 /**
- * Writes one audit_logs row. Callers pass exactly the before/after shape
- * they want recorded — this never accepts a raw DB row, so there's no
- * risk of a password_hash or token slipping into the log by accident;
- * the redaction rule is "only pass in what you'd be comfortable showing
- * an admin", enforced by every call site being explicit, not by this
- * function trying to guess what to strip after the fact.
+ * Append a record of an admin mutation.
+ *
+ * `session` is the Mongo session when the caller is inside a transaction
+ * (so the log commits or rolls back with the change it describes), or
+ * null for a standalone write.
+ *
+ * Callers pass only the fields they intend to log — never a whole
+ * document — which is what keeps password hashes and tokens out of the
+ * audit trail by construction rather than by after-the-fact redaction.
  */
-export async function logAudit(conn, { userId, action, entityType, entityId, before, after, ip }) {
-  await conn.execute(
-    `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, before_json, after_json, ip)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [
-      userId ?? null,
-      action,
-      entityType,
-      entityId,
-      before ? JSON.stringify(before) : null,
-      after ? JSON.stringify(after) : null,
-      ip ?? null,
-    ]
-  );
+export async function logAudit(session, { userId, action, entityType, entityId, before, after, ip }) {
+  const doc = {
+    user: userId ?? null,
+    action,
+    entityType,
+    entityId: entityId != null ? String(entityId) : null,
+    before: before ?? null,
+    after: after ?? null,
+    ip: ip ?? null,
+  };
+
+  if (session) {
+    await AuditLog.create([doc], { session });
+  } else {
+    await AuditLog.create(doc);
+  }
 }

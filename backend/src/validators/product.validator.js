@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { objectId } from './objectId.js';
 
 export const listProductsSchema = {
   query: z.object({
@@ -36,14 +37,14 @@ export const productIdentifierParamSchema = {
 
 export const productIdParamSchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
+    id: objectId,
   }),
 };
 
 export const productImageParamSchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
-    imageId: z.coerce.number().int().positive(),
+    id: objectId,
+    imageId: objectId,
   }),
 };
 
@@ -69,7 +70,7 @@ export const createProductSchema = {
   body: z.object({
     title: z.string().trim().min(2).max(200),
     description: z.string().trim().max(5000).optional(),
-    categoryId: z.coerce.number().int().positive(),
+    categoryId: objectId,
     basePrice: z.coerce.number().positive(),
     // Optional and normally empty from the admin UI — real photos go on
     // afterward via POST /:id/images (multipart upload), same as every

@@ -62,14 +62,14 @@ export default function CategoryFormModal({ category, topLevelCategories, onClos
       if (isEditing) {
         await updateCategory(category.id, {
           name: name.trim(),
-          parentId: parentId === '' ? null : Number(parentId),
+          parentId: parentId === '' ? null : parentId,
           imageUrl: imageUrl.trim() || null,
         });
         toast.success('Category updated');
       } else {
         await createCategory({
           name: name.trim(),
-          parentId: parentId === '' ? undefined : Number(parentId),
+          parentId: parentId === '' ? undefined : parentId,
           imageUrl: imageUrl.trim() || undefined,
         });
         toast.success('Category created');

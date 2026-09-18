@@ -1,49 +1,64 @@
-import { pool, withTransaction } from '../config/db.js';
+import mongoose from 'mongoose';
+import { Cart, Product } from '../models/index.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 /**
+ * Cart lines only store a product + variant id + quantity; price, stock
+ * and imagery are always read live from the product so a cart can never
+ * show a stale price. Resolving them means loading the referenced
+ * products and matching the embedded variant by its _id.
+ */
+async function resolveCartItems(cart) {
+  if (!cart || cart.items.length === 0) return [];
+
+  const products = await Product.find({ _id: { $in: cart.items.map((i) => i.product) } }).lean();
+  const byId = new Map(products.map((p) => [p._id.toString(), p]));
+
+  const items = [];
+  for (const line of cart.items) {
+    const product = byId.get(line.product.toString());
+    if (!product) continue; // product deleted since it was added
+    const variant = product.variants.find((v) => v._id.equals(line.variantId));
+    if (!variant) continue; // variant removed since it was added
+
+    const unitPrice = variant.priceOverride ?? product.basePrice;
+    items.push({
+      variantId: variant._id.toString(),
+      quantity: line.quantity,
+      sku: variant.sku,
+      stockQuantity: variant.stockQuantity,
+      unitPrice,
+      lineTotal: unitPrice * line.quantity,
+      productId: product._id.toString(),
+      productTitle: product.title,
+      productSlug: product.slug,
+      size: variant.size,
+      color: variant.color,
+      colorHex: variant.colorHex,
+      image: product.images.find((img) => img.isPrimary)?.imageUrl ?? null,
+    });
+  }
+  return items;
+}
+
+/** Finds the product owning an embedded variant — the equivalent of the
+ *  old `JOIN product_variants v ON v.id = ?`, since an embedded subdoc
+ *  can only be reached through its parent document. */
+async function findProductByVariantId(variantId) {
+  if (!mongoose.isValidObjectId(variantId)) return null;
+  return Product.findOne({ 'variants._id': variantId });
+}
+
+/**
  * GET /api/cart
- * Authenticated. Returns the caller's cart lines joined with live
+ * Authenticated. Returns the caller's cart lines with live
  * product/variant data (price, stock, primary image) plus a computed
  * subtotal — the frontend never has to re-derive pricing itself.
  */
 export const getCart = asyncHandler(async (req, res) => {
-  const [rows] = await pool.execute(
-    `SELECT
-       ci.variant_id, ci.quantity, ci.updated_at,
-       v.sku, v.stock_quantity,
-       COALESCE(v.price_override, p.base_price) AS unit_price,
-       p.id AS product_id, p.title AS product_title, p.slug AS product_slug,
-       s.code AS size, col.name AS color, col.hex_code AS color_hex,
-       pi.image_url AS image
-     FROM cart_items ci
-     JOIN product_variants v ON v.id = ci.variant_id
-     JOIN products p ON p.id = v.product_id
-     JOIN sizes s ON s.id = v.size_id
-     JOIN colors col ON col.id = v.color_id
-     LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = TRUE
-     WHERE ci.user_id = ?
-     ORDER BY ci.updated_at DESC`,
-    [req.user.id]
-  );
-
-  const items = rows.map((row) => ({
-    variantId: row.variant_id,
-    quantity: row.quantity,
-    sku: row.sku,
-    stockQuantity: row.stock_quantity,
-    unitPrice: row.unit_price,
-    lineTotal: row.unit_price * row.quantity,
-    productId: row.product_id,
-    productTitle: row.product_title,
-    productSlug: row.product_slug,
-    size: row.size,
-    color: row.color,
-    colorHex: row.color_hex,
-    image: row.image,
-  }));
-
+  const cart = await Cart.findOne({ user: req.user.id });
+  const items = await resolveCartItems(cart);
   const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0);
 
   res.json({ success: true, data: { items, subtotal } });
@@ -51,47 +66,46 @@ export const getCart = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/cart
- * Authenticated. Adds `quantity` of a variant to the cart, or increments
- * an existing line. Locks the variant row (and any existing cart row) for
- * the duration of the check so two rapid "add to cart" clicks can't both
- * pass a stale stock check.
+ * Authenticated. Adds `quantity` of a variant, or increments an existing
+ * line. The stock check reads the variant's live quantity and the result
+ * is written with an upsert; overselling is ultimately prevented at
+ * checkout, which decrements stock with a conditional atomic update.
  */
 export const addToCart = asyncHandler(async (req, res) => {
   const userId = req.user.id;
   const { variantId, quantity } = req.body;
 
-  const newQuantity = await withTransaction(async (conn) => {
-    const [variantRows] = await conn.execute(
-      'SELECT id, stock_quantity FROM product_variants WHERE id = ? FOR UPDATE',
-      [variantId]
-    );
-    const variant = variantRows[0];
-    if (!variant) throw ApiError.notFound('Product variant not found');
+  const product = await findProductByVariantId(variantId);
+  if (!product) throw ApiError.notFound('Product variant not found');
+  const variant = product.variants.id(variantId);
 
-    const [existingRows] = await conn.execute(
-      'SELECT quantity FROM cart_items WHERE user_id = ? AND variant_id = ? FOR UPDATE',
-      [userId, variantId]
-    );
-    const combinedQuantity = (existingRows[0]?.quantity ?? 0) + quantity;
+  const cart = await Cart.findOneAndUpdate(
+    { user: userId },
+    { $setOnInsert: { user: userId, items: [] } },
+    { new: true, upsert: true }
+  );
 
-    if (combinedQuantity > variant.stock_quantity) {
-      throw ApiError.conflict('Not enough stock available', {
-        requested: combinedQuantity,
-        available: variant.stock_quantity,
-      });
-    }
+  const existing = cart.items.find((i) => i.variantId.equals(variant._id));
+  const combinedQuantity = (existing?.quantity ?? 0) + quantity;
 
-    await conn.execute(
-      `INSERT INTO cart_items (user_id, variant_id, quantity)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE quantity = ?`,
-      [userId, variantId, combinedQuantity, combinedQuantity]
-    );
+  if (combinedQuantity > variant.stockQuantity) {
+    throw ApiError.conflict('Not enough stock available', {
+      requested: combinedQuantity,
+      available: variant.stockQuantity,
+    });
+  }
 
-    return combinedQuantity;
+  if (existing) {
+    existing.quantity = combinedQuantity;
+  } else {
+    cart.items.push({ product: product._id, variantId: variant._id, quantity });
+  }
+  await cart.save();
+
+  res.status(201).json({
+    success: true,
+    data: { variantId: variant._id.toString(), quantity: combinedQuantity },
   });
-
-  res.status(201).json({ success: true, data: { variantId, quantity: newQuantity } });
 });
 
 /**
@@ -100,35 +114,28 @@ export const addToCart = asyncHandler(async (req, res) => {
  * matches how a quantity <input> on the cart page typically behaves.
  */
 export const updateCartItem = asyncHandler(async (req, res) => {
-  const userId = req.user.id;
   const { variantId } = req.params;
   const { quantity } = req.body;
 
-  await withTransaction(async (conn) => {
-    const [variantRows] = await conn.execute(
-      'SELECT stock_quantity FROM product_variants WHERE id = ? FOR UPDATE',
-      [variantId]
-    );
-    const variant = variantRows[0];
-    if (!variant) throw ApiError.notFound('Product variant not found');
+  const product = await findProductByVariantId(variantId);
+  if (!product) throw ApiError.notFound('Product variant not found');
+  const variant = product.variants.id(variantId);
 
-    if (quantity > variant.stock_quantity) {
-      throw ApiError.conflict('Not enough stock available', {
-        requested: quantity,
-        available: variant.stock_quantity,
-      });
-    }
+  if (quantity > variant.stockQuantity) {
+    throw ApiError.conflict('Not enough stock available', {
+      requested: quantity,
+      available: variant.stockQuantity,
+    });
+  }
 
-    const [result] = await conn.execute(
-      'UPDATE cart_items SET quantity = ? WHERE user_id = ? AND variant_id = ?',
-      [quantity, userId, variantId]
-    );
-    if (result.affectedRows === 0) {
-      throw ApiError.notFound('Item is not in your cart');
-    }
-  });
+  const cart = await Cart.findOne({ user: req.user.id });
+  const line = cart?.items.find((i) => i.variantId.equals(variant._id));
+  if (!line) throw ApiError.notFound('Item is not in your cart');
 
-  res.json({ success: true, data: { variantId: Number(variantId), quantity } });
+  line.quantity = quantity;
+  await cart.save();
+
+  res.json({ success: true, data: { variantId: variant._id.toString(), quantity } });
 });
 
 /**
@@ -137,16 +144,19 @@ export const updateCartItem = asyncHandler(async (req, res) => {
  */
 export const removeCartItem = asyncHandler(async (req, res) => {
   const { variantId } = req.params;
-
-  const [result] = await pool.execute(
-    'DELETE FROM cart_items WHERE user_id = ? AND variant_id = ?',
-    [req.user.id, variantId]
-  );
-  if (result.affectedRows === 0) {
+  if (!mongoose.isValidObjectId(variantId)) {
     throw ApiError.notFound('Item is not in your cart');
   }
 
-  res.json({ success: true, data: { variantId: Number(variantId) } });
+  const result = await Cart.updateOne(
+    { user: req.user.id },
+    { $pull: { items: { variantId } } }
+  );
+  if (result.modifiedCount === 0) {
+    throw ApiError.notFound('Item is not in your cart');
+  }
+
+  res.json({ success: true, data: { variantId } });
 });
 
 /**
@@ -154,6 +164,6 @@ export const removeCartItem = asyncHandler(async (req, res) => {
  * Authenticated. Empties the whole cart (e.g. a "Clear cart" button).
  */
 export const clearCart = asyncHandler(async (req, res) => {
-  await pool.execute('DELETE FROM cart_items WHERE user_id = ?', [req.user.id]);
+  await Cart.updateOne({ user: req.user.id }, { $set: { items: [] } });
   res.json({ success: true, data: null });
 });

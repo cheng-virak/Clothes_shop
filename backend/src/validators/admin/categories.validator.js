@@ -1,22 +1,23 @@
 import { z } from 'zod';
+import { objectId } from '../objectId.js';
 
 export const categoryIdParamSchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
+    id: objectId,
   }),
 };
 
 export const checkSlugSchema = {
   query: z.object({
     slug: z.string().trim().min(1).max(120),
-    excludeId: z.coerce.number().int().positive().optional(),
+    excludeId: objectId.optional(),
   }),
 };
 
 export const createCategorySchema = {
   body: z.object({
     name: z.string().trim().min(1).max(100),
-    parentId: z.coerce.number().int().positive().nullable().optional(),
+    parentId: objectId.nullable().optional(),
     imageUrl: z.string().trim().url().nullable().optional(),
   }),
 };
@@ -27,12 +28,12 @@ export const createCategorySchema = {
 // that link with no redirect.
 export const updateCategorySchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
+    id: objectId,
   }),
   body: z
     .object({
       name: z.string().trim().min(1).max(100),
-      parentId: z.coerce.number().int().positive().nullable(),
+      parentId: objectId.nullable(),
       imageUrl: z.string().trim().url().nullable(),
     })
     .partial()
@@ -41,7 +42,7 @@ export const updateCategorySchema = {
 
 export const reorderCategorySchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
+    id: objectId,
   }),
   body: z.object({
     direction: z.enum(['up', 'down']),

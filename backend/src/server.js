@@ -1,13 +1,14 @@
 import app from './app.js';
 import { env } from './config/env.js';
-import { checkDbConnection } from './config/db.js';
+import { connectMongo, checkDbConnection } from './config/mongo.js';
 
 async function start() {
   try {
+    await connectMongo();
     await checkDbConnection();
-    console.log('✔ MySQL connection pool is healthy');
+    console.log(`✔ MongoDB connected (${env.mongo.dbName})`);
   } catch (err) {
-    console.error('✘ Failed to connect to MySQL:', err.message);
+    console.error('✘ Failed to connect to MongoDB:', err.message);
     process.exit(1);
   }
 

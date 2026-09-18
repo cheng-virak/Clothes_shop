@@ -1,17 +1,19 @@
 import bcrypt from 'bcryptjs';
-import { pool } from '../config/db.js';
+import { User } from '../models/index.js';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { generateToken } from '../utils/generateToken.js';
 
-function toPublicUser(row) {
+/** Response shape is unchanged from the MySQL version — `id` is the
+ *  ObjectId serialised to a string, so the frontend needs no changes. */
+function toPublicUser(doc) {
   return {
-    id: row.id,
-    fullName: row.full_name,
-    email: row.email,
-    phone: row.phone,
-    role: row.role,
+    id: doc._id.toString(),
+    fullName: doc.fullName,
+    email: doc.email,
+    phone: doc.phone ?? null,
+    role: doc.role,
   };
 }
 
@@ -23,28 +25,26 @@ function toPublicUser(row) {
 export const register = asyncHandler(async (req, res) => {
   const { fullName, email, password, phone } = req.body;
 
-  const [existing] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
-  if (existing.length > 0) {
+  const existing = await User.findOne({ email }).lean();
+  if (existing) {
     throw ApiError.conflict('An account with this email already exists');
   }
 
   const passwordHash = await bcrypt.hash(password, env.bcryptSaltRounds);
 
-  const [result] = await pool.execute(
-    `INSERT INTO users (full_name, email, password_hash, phone, role)
-     VALUES (?, ?, ?, ?, 'customer')`,
-    [fullName, email, passwordHash, phone ?? null]
-  );
+  const user = await User.create({
+    fullName,
+    email,
+    passwordHash,
+    phone: phone ?? null,
+    role: 'customer',
+  });
 
-  const user = { id: result.insertId, role: 'customer' };
-  const token = generateToken(user);
+  const token = generateToken({ id: user._id.toString(), role: user.role });
 
   res.status(201).json({
     success: true,
-    data: {
-      token,
-      user: { id: user.id, fullName, email, phone: phone ?? null, role: 'customer' },
-    },
+    data: { token, user: toPublicUser(user) },
   });
 });
 
@@ -56,23 +56,20 @@ export const register = asyncHandler(async (req, res) => {
 export const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
-  const [rows] = await pool.execute(
-    `SELECT id, full_name, email, password_hash, phone, role, is_active
-     FROM users WHERE email = ? LIMIT 1`,
-    [email]
-  );
-  const user = rows[0];
+  // passwordHash is `select: false` on the schema, so it has to be asked
+  // for explicitly — that default is what stops it leaking elsewhere.
+  const user = await User.findOne({ email }).select('+passwordHash');
 
-  if (!user || !user.is_active) {
+  if (!user || !user.isActive) {
     throw ApiError.unauthorized('Invalid email or password');
   }
 
-  const passwordMatches = await bcrypt.compare(password, user.password_hash);
+  const passwordMatches = await bcrypt.compare(password, user.passwordHash);
   if (!passwordMatches) {
     throw ApiError.unauthorized('Invalid email or password');
   }
 
-  const token = generateToken({ id: user.id, role: user.role });
+  const token = generateToken({ id: user._id.toString(), role: user.role });
 
   res.json({
     success: true,
@@ -85,11 +82,7 @@ export const login = asyncHandler(async (req, res) => {
  * Authenticated. Lets the frontend rehydrate the logged-in user on refresh.
  */
 export const getMe = asyncHandler(async (req, res) => {
-  const [rows] = await pool.execute(
-    'SELECT id, full_name, email, phone, role FROM users WHERE id = ? LIMIT 1',
-    [req.user.id]
-  );
-  const user = rows[0];
+  const user = await User.findById(req.user.id);
   if (!user) throw ApiError.notFound('User not found');
 
   res.json({ success: true, data: toPublicUser(user) });

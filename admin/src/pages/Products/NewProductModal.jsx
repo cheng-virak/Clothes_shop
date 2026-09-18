@@ -66,7 +66,7 @@ export default function NewProductModal({ onClose, onCreated }) {
       const res = await createProduct({
         title: title.trim(),
         description: description.trim() || undefined,
-        categoryId: Number(categoryId),
+        categoryId,
         basePrice: price,
         variants: variants.map((v) => ({
           sizeCode: v.sizeCode,

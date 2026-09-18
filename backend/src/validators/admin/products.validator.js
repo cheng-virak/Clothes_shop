@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { objectId } from '../objectId.js';
 
 export const listAdminProductsSchema = {
   query: z.object({
@@ -14,13 +15,13 @@ export const listAdminProductsSchema = {
 
 export const productIdParamSchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
+    id: objectId,
   }),
 };
 
 export const updateProductStatusSchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
+    id: objectId,
   }),
   body: z.object({
     status: z.enum(['draft', 'active', 'archived']),
@@ -32,13 +33,13 @@ export const updateProductStatusSchema = {
 // optional so the client can send only what changed.
 export const updateProductSchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
+    id: objectId,
   }),
   body: z
     .object({
       title: z.string().trim().min(2).max(200),
       description: z.string().trim().max(5000).nullable(),
-      categoryId: z.coerce.number().int().positive(),
+      categoryId: objectId,
       basePrice: z.coerce.number().positive(),
     })
     .partial()
@@ -49,8 +50,8 @@ export const updateProductSchema = {
 // the product's base price — omitted (undefined) leaves it unchanged.
 export const updateVariantSchema = {
   params: z.object({
-    id: z.coerce.number().int().positive(),
-    variantId: z.coerce.number().int().positive(),
+    id: objectId,
+    variantId: objectId,
   }),
   body: z
     .object({

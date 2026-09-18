@@ -2,7 +2,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { pool } from '../config/db.js';
+import { User } from '../models/index.js';
 
 /**
  * Verifies the Bearer JWT and attaches `req.user = { id, role }`.
@@ -25,17 +25,21 @@ export const verifyToken = asyncHandler(async (req, res, next) => {
     throw ApiError.unauthorized('Invalid or expired token');
   }
 
-  const [rows] = await pool.execute(
-    'SELECT id, role, is_active FROM users WHERE id = ? LIMIT 1',
-    [payload.sub]
-  );
-  const user = rows[0];
+  // A malformed/stale sub (e.g. an old integer id from a MySQL-era token)
+  // would make findById throw a CastError rather than return null, so it's
+  // treated as an invalid token instead of surfacing as a 500.
+  let user;
+  try {
+    user = await User.findById(payload.sub).select('role isActive').lean();
+  } catch {
+    throw ApiError.unauthorized('Invalid or expired token');
+  }
 
-  if (!user || !user.is_active) {
+  if (!user || !user.isActive) {
     throw ApiError.unauthorized('Account not found or disabled');
   }
 
-  req.user = { id: user.id, role: user.role };
+  req.user = { id: user._id.toString(), role: user.role };
   next();
 });
 
