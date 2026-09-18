@@ -1,6 +1,6 @@
 # Shope Clothes
 
-One Express + MySQL API, two independent React/Vite clients: the customer
+One Express + MongoDB API, two independent React/Vite clients: the customer
 storefront and the admin dashboard. Each client is its own app on its own
 port — not a shared bundle with a route prefix.
 
@@ -8,7 +8,7 @@ port — not a shared bundle with a route prefix.
 
 | App | Port | Folder | What it is |
 |---|---|---|---|
-| API | **5000** | `backend/` | Express + MySQL. `PORT` in `backend/.env` — this is the real value, change it there if you ever need to. |
+| API | **5000** | `backend/` | Express + MongoDB (Mongoose). `PORT` in `backend/.env` — this is the real value, change it there if you ever need to. |
 | Storefront | **5173** | `frontend/` | Customer-facing shop. |
 | Admin | **5174** | `admin/` | Back-office. No `/admin` prefix in its routes — the whole app *is* the admin, so its routes read `/`, `/login`, `/products`, etc. |
 
@@ -19,6 +19,23 @@ This is an npm workspace (`frontend`, `admin`, `backend`, `shared`) — install 
 ```powershell
 npm install
 ```
+
+The API needs a MongoDB database. Copy `backend/.env.example` to
+`backend/.env` and set `MONGODB_URI` to your MongoDB Atlas connection string
+(Atlas → Database → Connect → Drivers). In Atlas, **Network Access** must
+allow the IP the backend runs from, or the connection times out. MongoDB
+must be a replica set (every Atlas cluster is) — checkout and order status
+changes run in transactions, which a standalone local `mongod` can't do.
+
+Then create the baseline data — categories, store settings, and the admin
+account:
+
+```powershell
+npm run seed --workspace=backend
+```
+
+It only ever inserts what's missing, so it's safe to run against a database
+that already has real data.
 
 Run everything together:
 
@@ -44,9 +61,8 @@ npm run build
 
 ## Logging into the admin app
 
-Seed data creates one admin account (see `backend/sql/seed.sql` — the
-credentials are also printed to the terminal when you run the seed script,
-not just written in a comment):
+The seed script creates one admin account (`backend/scripts/seed.js` — the
+credentials are also printed to the terminal when it creates the account):
 
 - **Email:** `admin@shopeclothes.test`
 - **Password:** `Admin123!`

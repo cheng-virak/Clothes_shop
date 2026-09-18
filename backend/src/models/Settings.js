@@ -26,7 +26,7 @@ export async function getSettings(session) {
   const query = Settings.findOneAndUpdate(
     {},
     { $setOnInsert: {} },
-    { new: true, upsert: true, setDefaultsOnInsert: true }
+    { returnDocument: 'after', upsert: true, setDefaultsOnInsert: true }
   );
   if (session) query.session(session);
   return query;

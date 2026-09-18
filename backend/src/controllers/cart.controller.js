@@ -82,7 +82,7 @@ export const addToCart = asyncHandler(async (req, res) => {
   const cart = await Cart.findOneAndUpdate(
     { user: userId },
     { $setOnInsert: { user: userId, items: [] } },
-    { new: true, upsert: true }
+    { returnDocument: 'after', upsert: true }
   );
 
   const existing = cart.items.find((i) => i.variantId.equals(variant._id));
