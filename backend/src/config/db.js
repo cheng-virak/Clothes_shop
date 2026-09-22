@@ -4,9 +4,8 @@ import { env } from './env.js';
 const { Pool, types } = pg;
 
 /**
- * PostgreSQL (Neon) connection. Replaces the Mongoose connection in
- * mongo.js -- node-postgres owns a real connection pool, so `pool` is
- * the single object every query goes through.
+ * PostgreSQL (Neon) connection. node-postgres owns a real connection
+ * pool, so `pool` is the single object every query goes through.
  *
  * Two driver defaults are overridden below, both because they would
  * silently change the JSON the API returns.
@@ -81,14 +80,13 @@ export async function closePool() {
 }
 
 /**
- * Run `work(client)` inside a transaction -- the direct counterpart of
- * mongo.js's withTransaction(session).
+ * Run `work(client)` inside a transaction: a plain BEGIN/COMMIT on one
+ * checked-out connection.
  *
- * Unlike MongoDB this needs no replica set and no special setup; it is a
- * plain BEGIN/COMMIT on one checked-out connection. Callers must pass
- * that `client` into every query they run, exactly as they previously
- * passed the session, or the statement runs on a different connection
- * outside the transaction and will not roll back with it.
+ * Callers must pass that `client` into every query they run. A query
+ * sent through `query()` instead goes out on a different connection,
+ * outside the transaction, and will not roll back with it — which fails
+ * silently, since the statement still succeeds on its own.
  */
 export async function withTransaction(work) {
   const client = await pool.connect();

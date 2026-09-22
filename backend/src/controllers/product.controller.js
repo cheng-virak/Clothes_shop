@@ -14,10 +14,9 @@ const SORT_CLAUSES = {
 };
 
 /**
- * Variants and images were embedded arrays and came back with their
- * product for free. As real tables they are aggregated into the same
- * shape by the database, which keeps every read to one round trip
- * instead of the N+1 that loading them per product would cost.
+ * Variants and images are aggregated into nested JSON by the database,
+ * so a product arrives with everything needed to render it in a single
+ * round trip, instead of the N+1 that fetching them per product costs.
  */
 const VARIANTS_JSON = `
   COALESCE((
@@ -140,8 +139,9 @@ export const getProducts = asyncHandler(async (req, res) => {
   }
 
   // size/colour/inStock match a product that has AT LEAST ONE variant
-  // meeting all of them together — one EXISTS over the same variant row,
-  // which is what $elemMatch was doing.
+  // meeting all of them TOGETHER, which is why they go into a single
+  // EXISTS over one variant row rather than three separate conditions —
+  // those would match a red product that happens to also come in L.
   if (size || color || inStock) {
     const variantWhere = ['v.product_id = p.id'];
     if (size) variantWhere.push(`v.size = ${bind(size)}`);

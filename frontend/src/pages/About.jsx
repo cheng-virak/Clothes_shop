@@ -4,7 +4,7 @@ export default function About() {
       <h1 className="mb-4 text-2xl font-semibold text-stone-900">About Shope Clothes</h1>
       <p className="text-sm leading-relaxed text-stone-600">
         Shope Clothes is a clothing storefront built to demonstrate a modern full-stack
-        setup: a React + Vite + Tailwind frontend, a Node.js/Express API, and a MySQL
+        setup: a React + Vite + Tailwind frontend, a Node.js/Express API, and a PostgreSQL
         database, wired together end to end — real accounts, real inventory, real orders.
       </p>
     </div>

@@ -1,22 +1,21 @@
 -- Baseline schema for PostgreSQL (Neon).
 --
--- Replaces the MongoDB collections. Two shape changes are worth calling
--- out, because they undo choices that only made sense in a document store:
+-- Two design points worth stating up front:
 --
---   * Product variants and images were EMBEDDED subdocuments. They are
---     real tables again (product_variants, product_images). Embedding
---     bought single-document atomic stock updates; in Postgres a plain
---     UPDATE ... WHERE stock_quantity >= $n gives the same guarantee
---     through row locking, so nothing is lost.
---   * Order line items and status history were embedded arrays. They are
---     order_items / order_status_history again, still SNAPSHOTS: product
---     title, sku, size, colour and price are copied in at checkout so an
---     order renders correctly after the product is edited or deleted.
+--   * Product variants and images are tables of their own
+--     (product_variants, product_images) rather than columns hung off
+--     products. Stock correctness does not require denormalising them:
+--     a plain UPDATE ... WHERE stock_quantity >= $n is an atomic
+--     check-and-decrement, because Postgres locks the row for the
+--     duration of the statement.
+--   * Order line items and status history are their own tables too, and
+--     they are SNAPSHOTS: product title, sku, size, colour and price are
+--     copied in at checkout so an order still renders correctly after
+--     the product is edited or deleted.
 --
--- Ids are uuid rather than bigserial. The API previously handed out
--- 24-char ObjectIds as opaque strings and both clients treat them as
--- opaque; uuid keeps that property (and keeps order/product ids
--- non-enumerable), where an auto-increment integer would not.
+-- Ids are uuid rather than bigserial. Both clients treat an id as an
+-- opaque string, and uuid keeps order and product ids non-enumerable,
+-- which an auto-increment integer would not.
 
 CREATE TABLE IF NOT EXISTS users (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -234,9 +233,9 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_at              timestamptz    NOT NULL DEFAULT now()
 );
 
--- Mongoose kept `updatedAt` current by itself. A trigger restores that
--- for free rather than leaving every UPDATE statement to remember a
--- `updated_at = now()` clause it can silently omit.
+-- A trigger keeps `updated_at` current, rather than leaving every UPDATE
+-- statement to remember an `updated_at = now()` clause that it can
+-- silently omit without anything failing.
 CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
 BEGIN
   NEW.updated_at = now();

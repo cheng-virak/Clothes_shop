@@ -36,8 +36,8 @@ export const listOrders = asyncHandler(async (req, res) => {
   // `to` is an inclusive day in the UI, so match up to the end of it.
   if (to) where.push(`o.placed_at < ${bind(to)}::date + INTERVAL '1 day'`);
   if (q) {
-    // Customer name/email are a join away rather than a separate lookup:
-    // the document version had to resolve them to user ids first.
+    // Customer name and email come from the join on users, so searching
+    // them needs no separate lookup pass.
     const pattern = bind(likePattern(q));
     where.push(
       `(o.order_number ILIKE ${pattern} OR u.email ILIKE ${pattern} OR u.full_name ILIKE ${pattern})`

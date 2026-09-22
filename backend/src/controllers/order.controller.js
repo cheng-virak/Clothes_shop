@@ -19,9 +19,8 @@ import { generateOrderNumber } from '../utils/generateToken.js';
  * Postgres locks the row for the duration of the UPDATE, so a concurrent
  * checkout cannot read the same stale count between the predicate and the
  * write. If another order got there first the WHERE no longer matches,
- * rowCount is 0, and this order rolls back. This is the same guarantee
- * the document model got from a single-document atomic update, and the
- * same one the original MySQL schema needed SELECT ... FOR UPDATE for.
+ * rowCount is 0, and this order rolls back — no explicit lock needed, and
+ * no window in which two callers both act on the same stale count.
  */
 export const createOrder = asyncHandler(async (req, res) => {
   const userId = req.user.id;
@@ -177,9 +176,8 @@ export const createOrder = asyncHandler(async (req, res) => {
 /**
  * GET /api/orders/my-orders
  * Authenticated. Paginated order history for the logged-in user. The
- * items are aggregated by the database into the same nested array the
- * embedded version returned, so this is still one query rather than an
- * N+1 over the order list.
+ * database aggregates each order's items into a nested array, so this is
+ * one query rather than an N+1 over the order list.
  */
 export const getMyOrders = asyncHandler(async (req, res) => {
   const { page, limit } = req.query;

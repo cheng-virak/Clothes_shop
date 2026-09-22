@@ -25,10 +25,10 @@ export const verifyToken = asyncHandler(async (req, res, next) => {
     throw ApiError.unauthorized('Invalid or expired token');
   }
 
-  // A `sub` that isn't a uuid (an old ObjectId- or integer-era token from
-  // a previous datastore) makes Postgres reject the parameter outright
-  // rather than return no rows, so it's caught and treated as an invalid
-  // token instead of surfacing as a 500.
+  // A `sub` that isn't a uuid — a stale token issued before the current
+  // id scheme, say — makes Postgres reject the parameter outright rather
+  // than return no rows. Caught here and treated as an invalid token, so
+  // it answers 401 instead of surfacing as a 500.
   let rows;
   try {
     ({ rows } = await query('SELECT id, role, is_active FROM users WHERE id = $1', [payload.sub]));

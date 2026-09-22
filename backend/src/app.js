@@ -12,11 +12,11 @@ import { ApiError } from './utils/ApiError.js';
 
 const app = express();
 
-// No connect-before-first-request guard is needed here, the way MongoDB
-// needed one on serverless hosts: node-postgres opens a connection lazily
-// on the first query and the pool lives for as long as the warm instance
-// does, so an invocation that never touches the database never opens one
-// and no route has to wait on a handshake that has already happened.
+// No connect-before-first-request middleware is needed, even on a
+// serverless host: node-postgres opens a connection lazily on the first
+// query and the pool lives for as long as the warm instance does. An
+// invocation that never touches the database never opens a connection,
+// and no route waits on a handshake that has already happened.
 
 app.use(helmet());
 // Explicit allowlist from env.corsOrigins — never a wildcard, even though

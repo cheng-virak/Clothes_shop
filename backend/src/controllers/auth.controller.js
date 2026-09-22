@@ -8,10 +8,10 @@ import { generateToken } from '../utils/generateToken.js';
 /**
  * The columns a user row may be read with anywhere outside login.
  *
- * Mongoose enforced this with `select: false` on passwordHash, so a stray
- * `User.find()` could not leak a hash. Postgres has no such flag, so the
- * rule is this constant: read it, never `SELECT *` from users, and the
- * hash can only reach code that asks for it by name (login, below).
+ * Postgres has no way to mark a column as never-selected-by-default, so
+ * the rule lives here instead: read this constant, never `SELECT *` from
+ * users, and the hash can then only reach code that asks for it by name
+ * (login, below).
  */
 const PUBLIC_USER_COLUMNS = 'id, full_name, email, phone, role';
 

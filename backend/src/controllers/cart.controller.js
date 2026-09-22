@@ -7,11 +7,10 @@ import { asyncHandler } from '../utils/asyncHandler.js';
  * are always read live through the join so a cart can never show a stale
  * price.
  *
- * The document version had to skip lines whose product or variant had
- * been deleted since they were added. That case is gone: cart_items holds
- * a real foreign key to product_variants with ON DELETE CASCADE, so a
- * deleted variant takes its cart lines with it and a dangling line can no
- * longer exist to be filtered out.
+ * A cart line cannot outlive what it points at: cart_items holds a real
+ * foreign key to product_variants with ON DELETE CASCADE, so a deleted
+ * variant takes its cart lines with it. That is why nothing here filters
+ * out dangling lines — there is no way for one to exist.
  */
 const CART_ITEMS_SQL = `
   SELECT ci.variant_id,
@@ -55,9 +54,7 @@ function toCartItem(row) {
   };
 }
 
-/** The variant a cart operation targets, or a 404 — replaces the
- *  "find the product that embeds this variant" lookup the document model
- *  forced, since a variant is a row of its own again. */
+/** The variant a cart operation targets, or a 404. */
 async function findVariant(variantId) {
   const { rows } = await query(
     'SELECT id, sku, stock_quantity FROM product_variants WHERE id = $1',
