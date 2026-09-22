@@ -1,6 +1,8 @@
 /**
- * Mirrors the CURRENT `orders.order_status` ENUM in schema.sql exactly:
- *   ENUM('pending','confirmed','processing','shipped','delivered','cancelled')
+ * Mirrors the CURRENT `orders.order_status` CHECK constraint in
+ * backend/migrations/001_init.sql exactly:
+ *   CHECK (order_status IN ('pending','confirmed','processing',
+ *                           'shipped','delivered','cancelled'))
  *
  * Note: this is deliberately NOT the richer pending→paid→shipped→refunded
  * state machine discussed for a future iteration — 'paid'/'refunded'

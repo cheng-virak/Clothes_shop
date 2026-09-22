@@ -7,18 +7,16 @@ import rateLimit from 'express-rate-limit';
 import { env } from './config/env.js';
 import routes from './routes/index.js';
 import { notFoundHandler, errorHandler } from './middlewares/error.middleware.js';
-import { UPLOADS_DIR } from './middlewares/upload.middleware.js';
+import { UPLOADS_DIR } from './storage/disk.storage.js';
 import { ApiError } from './utils/ApiError.js';
-import { connectMongo } from './config/mongo.js';
 
 const app = express();
 
-// On serverless hosts (Vercel) this module is the entrypoint and server.js
-// never runs, so make sure MongoDB is connected before any route runs.
-// Locally it's a no-op: server.js has already connected.
-app.use((req, res, next) => {
-  connectMongo().then(() => next(), next);
-});
+// No connect-before-first-request guard is needed here, the way MongoDB
+// needed one on serverless hosts: node-postgres opens a connection lazily
+// on the first query and the pool lives for as long as the warm instance
+// does, so an invocation that never touches the database never opens one
+// and no route has to wait on a handshake that has already happened.
 
 app.use(helmet());
 // Explicit allowlist from env.corsOrigins — never a wildcard, even though
@@ -59,9 +57,16 @@ app.use('/api/auth', authLimiter);
 
 app.get('/health', (req, res) => res.json({ success: true, status: 'ok' }));
 
-// Uploaded product images. Reached through the frontend's dev proxy (see
-// vite.config.js) so the browser only ever requests same-origin, keeping
-// this behind the same helmet/CORS posture as everything else.
+// Uploaded product images, for LOCAL DEVELOPMENT only. Reached through
+// each client's dev proxy (see their vite.config.js) so the browser only
+// ever requests same-origin, keeping this behind the same helmet/CORS
+// posture as everything else.
+//
+// This line does nothing on Vercel — `express.static()` is explicitly
+// unsupported there, and the filesystem is read-only anyway. It doesn't
+// need to work: with a Blob store connected, images are stored at
+// absolute CDN URLs and never routed through Express at all. Left in
+// place because it is what makes the local disk backend usable.
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 app.use('/api', routes);

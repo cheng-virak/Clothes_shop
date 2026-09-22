@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "main": "src/index.js",
   "exports": {
     "./format": "./src/format.js",
     "./orderStatus": "./src/orderStatus.js",

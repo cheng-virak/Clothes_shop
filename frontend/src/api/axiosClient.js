@@ -2,7 +2,14 @@ import axios from 'axios';
 import { useAuthStore } from '../store/useAuthStore.js';
 
 const axiosClient = axios.create({
-  baseURL: '/api', // proxied to the backend in dev, see vite.config.js
+  // Relative by default — proxied to the backend in dev (see
+  // vite.config.js), and correct in production too whenever the API is
+  // served from the same origin as this app. VITE_API_BASE_URL overrides
+  // it with an absolute URL for the deployment shape this project
+  // actually uses, where the storefront and the API are separate Vercel
+  // projects on separate domains. That origin must also be listed in the
+  // API's CORS_ORIGINS, or the browser blocks every request.
+  baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
   headers: { 'Content-Type': 'application/json' },
 });
 

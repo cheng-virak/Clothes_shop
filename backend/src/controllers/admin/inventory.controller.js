@@ -1,84 +1,88 @@
-import { withTransaction } from '../../config/mongo.js';
-import { Category, Product, getSettings } from '../../models/index.js';
+import { query, withTransaction } from '../../config/db.js';
+import { getSettings } from '../../repositories/settings.repo.js';
 import { ApiError } from '../../utils/ApiError.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
-import { logAudit } from '../../utils/auditLog.js';
 
 const SORT_CLAUSES = {
-  stock_asc: { stock_quantity: 1, _id: 1 },
-  stock_desc: { stock_quantity: -1, _id: 1 },
+  stock_asc: 'v.stock_quantity ASC, v.id ASC',
+  stock_desc: 'v.stock_quantity DESC, v.id ASC',
 };
 
 /**
  * GET /api/admin/inventory
  * staff or admin. One row per VARIANT (not product) — a size/colour combo
- * is what actually has a stock count, so the embedded variants are
- * $unwind-ed into rows. lowStock/outOfStock compare against the single
- * configured settings.lowStockThreshold. Defaults to stock ascending — the
- * point of this screen is surfacing what's running out first.
+ * is what actually has a stock count, and since variants are a table
+ * again that is simply what this selects, with no $unwind needed.
+ * lowStock/outOfStock compare against the single configured
+ * settings.lowStockThreshold. Defaults to stock ascending — the point of
+ * this screen is surfacing what's running out first.
  */
 export const listInventory = asyncHandler(async (req, res) => {
   const { lowStock, outOfStock, category, sort, page, limit } = req.query;
   const { lowStockThreshold } = await getSettings();
 
-  const productMatch = {};
-  if (category) {
-    const categoryDoc = await Category.findOne({ slug: category }).select('_id').lean();
-    productMatch.category = categoryDoc ? categoryDoc._id : null;
-  }
+  const params = [];
+  const bind = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
 
-  const variantMatch = {};
-  if (outOfStock) variantMatch.stock_quantity = 0;
-  else if (lowStock) variantMatch.stock_quantity = { $lte: lowStockThreshold };
+  const where = ['TRUE'];
 
-  const rowsPipeline = [
-    { $match: productMatch },
-    { $unwind: '$variants' },
-    {
-      $project: {
-        variant_id: '$variants._id',
-        product_id: '$_id',
-        product_title: '$title',
-        category: 1,
-        size: '$variants.size',
-        color: '$variants.color',
-        sku: '$variants.sku',
-        stock_quantity: '$variants.stockQuantity',
-      },
-    },
-    { $match: variantMatch },
-  ];
+  if (category) where.push(`c.slug = ${bind(category)}`);
+  if (outOfStock) where.push('v.stock_quantity = 0');
+  else if (lowStock) where.push(`v.stock_quantity <= ${bind(lowStockThreshold)}`);
 
-  const [countResult] = await Product.aggregate([...rowsPipeline, { $count: 'total' }]);
-  const total = countResult?.total ?? 0;
+  const fromAndWhere = `
+      FROM product_variants v
+      JOIN products p   ON p.id = v.product_id
+      JOIN categories c ON c.id = p.category_id
+     WHERE ${where.join(' AND ')}`;
 
-  const rows = await Product.aggregate([
-    ...rowsPipeline,
-    { $sort: SORT_CLAUSES[sort] ?? SORT_CLAUSES.stock_asc },
-    { $skip: (page - 1) * limit },
-    { $limit: limit },
-    { $lookup: { from: 'categories', localField: 'category', foreignField: '_id', as: 'categoryDoc' } },
-    { $unwind: { path: '$categoryDoc', preserveNullAndEmptyArrays: true } },
+  const filterParams = [...params];
+  const pageParams = [...params, limit, (page - 1) * limit];
+  const limitAt = `$${params.length + 1}`;
+  const offsetAt = `$${params.length + 2}`;
+
+  const [{ rows: countRows }, { rows }] = await Promise.all([
+    query(`SELECT COUNT(*) AS total ${fromAndWhere}`, filterParams),
+    query(
+      `SELECT v.id    AS variant_id,
+              p.id    AS product_id,
+              p.title AS product_title,
+              c.name  AS category_name,
+              c.slug  AS category_slug,
+              v.size,
+              v.color,
+              v.sku,
+              v.stock_quantity
+         ${fromAndWhere}
+        ORDER BY ${SORT_CLAUSES[sort] ?? SORT_CLAUSES.stock_asc}
+        LIMIT ${limitAt} OFFSET ${offsetAt}`,
+      pageParams
+    ),
   ]);
 
-  const data = rows.map((r) => ({
-    variant_id: r.variant_id.toString(),
-    product_id: r.product_id.toString(),
-    product_title: r.product_title,
-    category_name: r.categoryDoc?.name ?? null,
-    category_slug: r.categoryDoc?.slug ?? null,
-    size: r.size,
-    color: r.color,
-    sku: r.sku,
-    stock_quantity: r.stock_quantity,
-  }));
+  const total = countRows[0].total;
 
   res.json({
     success: true,
-    data,
+    data: rows,
     meta: { page, limit, total, totalPages: Math.ceil(total / limit), lowStockThreshold },
   });
 });
+
+/**
+ * A CSV import may list the same SKU twice. Collapsing to one entry per
+ * SKU, last occurrence winning, keeps the outcome the same as applying
+ * the rows in order while letting the whole import run as set-based
+ * statements rather than a round trip per row.
+ */
+function dedupeRows(rows) {
+  const bySku = new Map();
+  for (const row of rows) bySku.set(row.sku, row.stockQuantity);
+  return bySku;
+}
 
 /**
  * POST /api/admin/inventory/import/preview
@@ -88,28 +92,30 @@ export const listInventory = asyncHandler(async (req, res) => {
  */
 export const previewImport = asyncHandler(async (req, res) => {
   const { rows } = req.body;
+  const bySku = dedupeRows(rows);
 
-  const products = await Product.find({ 'variants.sku': { $in: rows.map((r) => r.sku) } }).lean();
-  const bySku = new Map();
-  for (const product of products) {
-    for (const variant of product.variants) {
-      bySku.set(variant.sku, { product, variant });
-    }
-  }
+  const { rows: found } = await query(
+    `SELECT v.id, v.sku, v.size, v.color, v.stock_quantity, p.title AS product_title
+       FROM product_variants v
+       JOIN products p ON p.id = v.product_id
+      WHERE v.sku = ANY($1)`,
+    [[...bySku.keys()]]
+  );
+  const variantBySku = new Map(found.map((v) => [v.sku, v]));
 
-  const results = rows.map((row) => {
-    const hit = bySku.get(row.sku);
-    if (!hit) return { sku: row.sku, found: false, newStock: row.stockQuantity };
+  const results = [...bySku].map(([sku, newStock]) => {
+    const hit = variantBySku.get(sku);
+    if (!hit) return { sku, found: false, newStock };
     return {
-      sku: row.sku,
+      sku,
       found: true,
-      variantId: hit.variant._id.toString(),
-      productTitle: hit.product.title,
-      size: hit.variant.size,
-      color: hit.variant.color,
-      currentStock: hit.variant.stockQuantity,
-      newStock: row.stockQuantity,
-      delta: row.stockQuantity - hit.variant.stockQuantity,
+      variantId: hit.id,
+      productTitle: hit.product_title,
+      size: hit.size,
+      color: hit.color,
+      currentStock: hit.stock_quantity,
+      newStock,
+      delta: newStock - hit.stock_quantity,
     };
   });
 
@@ -122,39 +128,70 @@ export const previewImport = asyncHandler(async (req, res) => {
  * which could be stale by the time the admin confirms) inside ONE
  * transaction — any unknown SKU aborts the whole import, so it's all rows
  * or none. Each row's before/after stock is audit-logged individually.
+ *
+ * An import can carry up to 2000 rows, so this is set-based: four
+ * statements regardless of the row count, rather than a lookup, an update
+ * and a log per row (which at that size is thousands of round trips to a
+ * database on the other side of the network).
  */
 export const applyImport = asyncHandler(async (req, res) => {
   const { rows } = req.body;
   const actorUserId = req.user.id;
+  const bySku = dedupeRows(rows);
+  const skus = [...bySku.keys()];
 
-  const changes = await withTransaction(async (session) => {
-    const applied = [];
-    for (const row of rows) {
-      const product = await Product.findOne({ 'variants.sku': row.sku }).session(session);
-      const variant = product?.variants.find((v) => v.sku === row.sku);
-      if (!variant) {
-        throw ApiError.badRequest(`Unknown SKU: ${row.sku} — import aborted, nothing was changed`);
-      }
+  const changes = await withTransaction(async (client) => {
+    // FOR UPDATE so the before-values reported below are the ones this
+    // transaction actually overwrites, not a snapshot another writer
+    // changed in between.
+    const { rows: current } = await client.query(
+      'SELECT id, sku, stock_quantity FROM product_variants WHERE sku = ANY($1) FOR UPDATE',
+      [skus]
+    );
 
-      const before = variant.stockQuantity;
-      await Product.updateOne(
-        { _id: product._id, 'variants._id': variant._id },
-        { $set: { 'variants.$.stockQuantity': row.stockQuantity } },
-        { session }
-      );
-
-      await logAudit(session, {
-        userId: actorUserId,
-        action: 'inventory.stock_imported',
-        entityType: 'product_variant',
-        entityId: variant._id.toString(),
-        before: { stockQuantity: before },
-        after: { stockQuantity: row.stockQuantity },
-        ip: req.ip,
-      });
-
-      applied.push({ sku: row.sku, variantId: variant._id.toString(), from: before, to: row.stockQuantity });
+    const bySkuCurrent = new Map(current.map((v) => [v.sku, v]));
+    const unknown = skus.find((sku) => !bySkuCurrent.has(sku));
+    if (unknown) {
+      throw ApiError.badRequest(`Unknown SKU: ${unknown} — import aborted, nothing was changed`);
     }
+
+    const quantities = skus.map((sku) => bySku.get(sku));
+
+    await client.query(
+      `UPDATE product_variants v
+          SET stock_quantity = incoming.stock_quantity
+         FROM unnest($1::text[], $2::integer[]) AS incoming(sku, stock_quantity)
+        WHERE v.sku = incoming.sku`,
+      [skus, quantities]
+    );
+
+    const applied = skus.map((sku) => ({
+      sku,
+      variantId: bySkuCurrent.get(sku).id,
+      from: bySkuCurrent.get(sku).stock_quantity,
+      to: bySku.get(sku),
+    }));
+
+    // One INSERT for the whole import rather than a statement per row.
+    const values = [];
+    const params = [actorUserId, req.ip ?? null];
+    for (const change of applied) {
+      const base = params.length;
+      values.push(
+        `($1, 'inventory.stock_imported', 'product_variant', $${base + 1}, $${base + 2}, $${base + 3}, $2)`
+      );
+      params.push(
+        change.variantId,
+        JSON.stringify({ stockQuantity: change.from }),
+        JSON.stringify({ stockQuantity: change.to })
+      );
+    }
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, before, after, ip)
+       VALUES ${values.join(', ')}`,
+      params
+    );
+
     return applied;
   });
 

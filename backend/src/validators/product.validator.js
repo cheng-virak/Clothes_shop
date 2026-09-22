@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { objectId } from './objectId.js';
+import { uuid } from './uuid.js';
 
 export const listProductsSchema = {
   query: z.object({
@@ -31,26 +31,26 @@ export const suggestProductsSchema = {
 
 export const productIdentifierParamSchema = {
   params: z.object({
-    identifier: z.string().trim().min(1).max(220), // numeric id or slug
+    identifier: z.string().trim().min(1).max(220), // uuid or slug
   }),
 };
 
 export const productIdParamSchema = {
   params: z.object({
-    id: objectId,
+    id: uuid,
   }),
 };
 
 export const productImageParamSchema = {
   params: z.object({
-    id: objectId,
-    imageId: objectId,
+    id: uuid,
+    imageId: uuid,
   }),
 };
 
 // Apparel sizes, 'ONE_SIZE' (no size selector shown on the storefront for
 // these — totes, beanies, sunglasses, etc.), and belt waist sizes in
-// inches. Matches the rows seeded into the `sizes` table (see seed.sql).
+// inches. Mirrors the size values the product form offers.
 const SIZE_CODES = ['S', 'M', 'L', 'XL', 'XXL', 'ONE_SIZE', '30', '32', '34', '36'];
 
 const variantSchema = z.object({
@@ -70,7 +70,7 @@ export const createProductSchema = {
   body: z.object({
     title: z.string().trim().min(2).max(200),
     description: z.string().trim().max(5000).optional(),
-    categoryId: objectId,
+    categoryId: uuid,
     basePrice: z.coerce.number().positive(),
     // Optional and normally empty from the admin UI — real photos go on
     // afterward via POST /:id/images (multipart upload), same as every

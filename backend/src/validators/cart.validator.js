@@ -1,22 +1,22 @@
 import { z } from 'zod';
-import { objectId } from './objectId.js';
+import { uuid } from './uuid.js';
 
 export const addToCartSchema = {
   body: z.object({
-    variantId: objectId,
+    variantId: uuid,
     quantity: z.coerce.number().int().positive().max(99).default(1),
   }),
 };
 
 export const cartItemParamSchema = {
   params: z.object({
-    variantId: objectId,
+    variantId: uuid,
   }),
 };
 
 export const updateCartItemSchema = {
   params: z.object({
-    variantId: objectId,
+    variantId: uuid,
   }),
   body: z.object({
     quantity: z.coerce.number().int().positive().max(99),

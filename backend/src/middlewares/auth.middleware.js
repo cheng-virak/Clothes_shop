@@ -1,13 +1,13 @@
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
+import { query } from '../config/db.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { User } from '../models/index.js';
 
 /**
  * Verifies the Bearer JWT and attaches `req.user = { id, role }`.
  * Re-reads the user's active/role status from the DB on every request
- * (cheap indexed lookup) so a deactivated account or a revoked admin
+ * (cheap primary-key lookup) so a deactivated account or a revoked admin
  * role takes effect immediately instead of waiting for token expiry.
  */
 export const verifyToken = asyncHandler(async (req, res, next) => {
@@ -25,21 +25,23 @@ export const verifyToken = asyncHandler(async (req, res, next) => {
     throw ApiError.unauthorized('Invalid or expired token');
   }
 
-  // A malformed/stale sub (e.g. an old integer id from a MySQL-era token)
-  // would make findById throw a CastError rather than return null, so it's
-  // treated as an invalid token instead of surfacing as a 500.
-  let user;
+  // A `sub` that isn't a uuid (an old ObjectId- or integer-era token from
+  // a previous datastore) makes Postgres reject the parameter outright
+  // rather than return no rows, so it's caught and treated as an invalid
+  // token instead of surfacing as a 500.
+  let rows;
   try {
-    user = await User.findById(payload.sub).select('role isActive').lean();
+    ({ rows } = await query('SELECT id, role, is_active FROM users WHERE id = $1', [payload.sub]));
   } catch {
     throw ApiError.unauthorized('Invalid or expired token');
   }
 
-  if (!user || !user.isActive) {
+  const user = rows[0];
+  if (!user || !user.is_active) {
     throw ApiError.unauthorized('Account not found or disabled');
   }
 
-  req.user = { id: user._id.toString(), role: user.role };
+  req.user = { id: user.id, role: user.role };
   next();
 });
 

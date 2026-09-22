@@ -1,5 +1,5 @@
-import { withTransaction } from '../config/mongo.js';
-import { Cart, Order, Product, getSettings } from '../models/index.js';
+import { query, withTransaction } from '../config/db.js';
+import { getSettings } from '../repositories/settings.repo.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { generateOrderNumber } from '../utils/generateToken.js';
@@ -10,51 +10,50 @@ import { generateOrderNumber } from '../utils/generateToken.js';
  * from client-supplied line items — the server is the source of truth for
  * price and stock), inside one transaction.
  *
- * Overselling is prevented differently than it was in MySQL. There, the
- * variant rows were locked with SELECT ... FOR UPDATE, checked, then
- * decremented. Here the check and the decrement are a single conditional
- * update:
+ * Overselling is prevented by making the check and the decrement a single
+ * statement:
  *
- *   updateOne({ _id, variants: { $elemMatch: { _id, stockQuantity: { $gte: qty } } } },
- *             { $inc: { 'variants.$.stockQuantity': -qty } })
+ *   UPDATE product_variants SET stock_quantity = stock_quantity - $qty
+ *    WHERE id = $id AND stock_quantity >= $qty
  *
- * A document-level update in MongoDB is atomic, so the "is there enough
- * stock" predicate and the decrement can't be split by a concurrent
- * checkout. If another order got there first, the filter no longer
- * matches, modifiedCount is 0, and this order rolls back — no lock
- * needed, and no window where two callers both read the same stale count.
+ * Postgres locks the row for the duration of the UPDATE, so a concurrent
+ * checkout cannot read the same stale count between the predicate and the
+ * write. If another order got there first the WHERE no longer matches,
+ * rowCount is 0, and this order rolls back. This is the same guarantee
+ * the document model got from a single-document atomic update, and the
+ * same one the original MySQL schema needed SELECT ... FOR UPDATE for.
  */
 export const createOrder = asyncHandler(async (req, res) => {
   const userId = req.user.id;
   const { shippingAddress, paymentMethod } = req.body;
 
-  const order = await withTransaction(async (session) => {
-    const cart = await Cart.findOne({ user: userId }).session(session);
-    if (!cart || cart.items.length === 0) {
+  const order = await withTransaction(async (client) => {
+    const { rows: lines } = await client.query(
+      `SELECT ci.quantity,
+              v.id  AS variant_id,
+              v.sku,
+              v.size,
+              v.color,
+              p.id    AS product_id,
+              p.title AS product_title,
+              COALESCE(v.price_override, p.base_price) AS unit_price
+         FROM cart_items ci
+         JOIN carts c            ON c.id = ci.cart_id
+         JOIN product_variants v ON v.id = ci.variant_id
+         JOIN products p         ON p.id = v.product_id
+        WHERE c.user_id = $1
+        ORDER BY ci.added_at`,
+      [userId]
+    );
+
+    if (lines.length === 0) {
       throw ApiError.badRequest('Your cart is empty');
     }
 
-    const products = await Product.find({ _id: { $in: cart.items.map((i) => i.product) } }).session(session);
-    const byId = new Map(products.map((p) => [p._id.toString(), p]));
+    const settings = await getSettings(client);
 
-    const settings = await getSettings(session);
-
-    const lines = [];
-    for (const line of cart.items) {
-      const product = byId.get(line.product.toString());
-      if (!product) throw ApiError.conflict('A product in your cart is no longer available');
-
-      const variant = product.variants.id(line.variantId);
-      if (!variant) throw ApiError.conflict('A product in your cart is no longer available');
-
-      const unitPrice = variant.priceOverride ?? product.basePrice;
-      lines.push({
-        product,
-        variant,
-        quantity: line.quantity,
-        unitPrice,
-        lineTotal: unitPrice * line.quantity,
-      });
+    for (const line of lines) {
+      line.lineTotal = line.unit_price * line.quantity;
     }
 
     const subtotal = lines.reduce((sum, l) => sum + l.lineTotal, 0);
@@ -63,71 +62,113 @@ export const createOrder = asyncHandler(async (req, res) => {
     const grandTotal = subtotal + shippingFee + taxTotal;
 
     // Decrement first: if any line can't be satisfied the whole
-    // transaction aborts before an order document exists.
-    for (const l of lines) {
-      const result = await Product.updateOne(
-        {
-          _id: l.product._id,
-          variants: { $elemMatch: { _id: l.variant._id, stockQuantity: { $gte: l.quantity } } },
-        },
-        { $inc: { 'variants.$.stockQuantity': -l.quantity } },
-        { session }
+    // transaction aborts before an order row exists.
+    for (const line of lines) {
+      const { rowCount } = await client.query(
+        `UPDATE product_variants
+            SET stock_quantity = stock_quantity - $1
+          WHERE id = $2 AND stock_quantity >= $1`,
+        [line.quantity, line.variant_id]
       );
 
-      if (result.modifiedCount !== 1) {
+      if (rowCount !== 1) {
+        // Re-read purely to tell the shopper what IS available; the
+        // decision was already made by the UPDATE above.
+        const { rows: current } = await client.query(
+          'SELECT stock_quantity FROM product_variants WHERE id = $1',
+          [line.variant_id]
+        );
         throw ApiError.conflict('Some items in your cart no longer have enough stock', [
-          { sku: l.variant.sku, requested: l.quantity, available: l.variant.stockQuantity },
+          {
+            sku: line.sku,
+            requested: line.quantity,
+            available: current[0]?.stock_quantity ?? 0,
+          },
         ]);
       }
     }
 
-    const [created] = await Order.create(
+    const { rows: created } = await client.query(
+      `INSERT INTO orders (
+         order_number, user_id,
+         shipping_name, shipping_phone, shipping_line1, shipping_line2,
+         shipping_city, shipping_state, shipping_postal, shipping_country,
+         subtotal, shipping_fee, tax_total, grand_total,
+         payment_method, payment_status, order_status
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', 'pending')
+       RETURNING id, order_number, grand_total`,
       [
-        {
-          orderNumber: generateOrderNumber(),
-          user: userId,
-          shipping: {
-            name: shippingAddress.recipientName,
-            phone: shippingAddress.phone,
-            line1: shippingAddress.line1,
-            line2: shippingAddress.line2 ?? null,
-            city: shippingAddress.city,
-            // No longer collected at checkout; kept optional so migrated
-            // orders retain whatever they were originally placed with.
-            state: shippingAddress.state ?? null,
-            postal: shippingAddress.postalCode ?? null,
-            country: shippingAddress.country ?? null,
-          },
-          subtotal,
-          shippingFee,
-          taxTotal,
-          grandTotal,
-          paymentMethod,
-          paymentStatus: 'pending',
-          orderStatus: 'pending',
-          items: lines.map((l) => ({
-            productId: l.product._id,
-            variantId: l.variant._id,
-            productTitle: l.product.title,
-            sku: l.variant.sku,
-            sizeCode: l.variant.size,
-            colorName: l.variant.color,
-            unitPrice: l.unitPrice,
-            quantity: l.quantity,
-            lineTotal: l.lineTotal,
-          })),
-          // changedBy is the customer themselves — the one status change
-          // no admin makes — so the timeline reads "who did what, when"
-          // from its very first entry.
-          statusHistory: [{ status: 'pending', note: 'Order placed', changedBy: userId }],
-        },
-      ],
-      { session }
+        generateOrderNumber(),
+        userId,
+        shippingAddress.recipientName,
+        shippingAddress.phone,
+        shippingAddress.line1,
+        shippingAddress.line2 ?? null,
+        shippingAddress.city,
+        // No longer collected at checkout; kept optional so migrated
+        // orders retain whatever they were originally placed with.
+        shippingAddress.state ?? null,
+        shippingAddress.postalCode ?? null,
+        shippingAddress.country ?? null,
+        subtotal,
+        shippingFee,
+        taxTotal,
+        grandTotal,
+        paymentMethod,
+      ]
+    );
+    const orderRow = created[0];
+
+    // Line items are a SNAPSHOT: title, sku, size, colour and price are
+    // copied in here so the order still renders correctly after the
+    // product is edited or deleted.
+    const values = [];
+    const params = [orderRow.id];
+    for (const line of lines) {
+      const base = params.length;
+      values.push(
+        `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, ` +
+          `$${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`
+      );
+      params.push(
+        line.product_id,
+        line.variant_id,
+        line.product_title,
+        line.sku,
+        line.size,
+        line.color,
+        line.unit_price,
+        line.quantity,
+        line.lineTotal
+      );
+    }
+    await client.query(
+      `INSERT INTO order_items
+         (order_id, product_id, variant_id, product_title, sku, size_code, color_name,
+          unit_price, quantity, line_total)
+       VALUES ${values.join(', ')}`,
+      params
     );
 
-    await Cart.updateOne({ user: userId }, { $set: { items: [] } }, { session });
+    // changed_by is the customer themselves — the one status change no
+    // admin makes — so the timeline reads "who did what, when" from its
+    // very first entry.
+    await client.query(
+      `INSERT INTO order_status_history (order_id, status, note, changed_by)
+       VALUES ($1, 'pending', 'Order placed', $2)`,
+      [orderRow.id, userId]
+    );
 
-    return { id: created._id.toString(), orderNumber: created.orderNumber, grandTotal: created.grandTotal };
+    await client.query(
+      'DELETE FROM cart_items WHERE cart_id = (SELECT id FROM carts WHERE user_id = $1)',
+      [userId]
+    );
+
+    return {
+      id: orderRow.id,
+      orderNumber: orderRow.order_number,
+      grandTotal: orderRow.grand_total,
+    };
   });
 
   res.status(201).json({ success: true, data: order });
@@ -135,47 +176,55 @@ export const createOrder = asyncHandler(async (req, res) => {
 
 /**
  * GET /api/orders/my-orders
- * Authenticated. Paginated order history for the logged-in user. Items
- * come back embedded already, so this is one query rather than the
- * JSON_ARRAYAGG join the SQL version needed to avoid N+1.
+ * Authenticated. Paginated order history for the logged-in user. The
+ * items are aggregated by the database into the same nested array the
+ * embedded version returned, so this is still one query rather than an
+ * N+1 over the order list.
  */
 export const getMyOrders = asyncHandler(async (req, res) => {
   const { page, limit } = req.query;
-  const skip = (page - 1) * limit;
+  const userId = req.user.id;
 
-  const [orders, total] = await Promise.all([
-    Order.find({ user: req.user.id }).sort({ placedAt: -1 }).skip(skip).limit(limit).lean(),
-    Order.countDocuments({ user: req.user.id }),
+  const [{ rows: countRows }, { rows }] = await Promise.all([
+    query('SELECT COUNT(*) AS total FROM orders WHERE user_id = $1', [userId]),
+    query(
+      `SELECT o.id,
+              o.order_number,
+              o.subtotal,
+              o.shipping_fee,
+              o.grand_total,
+              o.payment_method,
+              o.payment_status,
+              o.order_status,
+              o.tracking_number,
+              o.tracking_carrier,
+              o.placed_at,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                         'productTitle', i.product_title,
+                         'sku',          i.sku,
+                         'size',         i.size_code,
+                         'color',        i.color_name,
+                         'unitPrice',    i.unit_price,
+                         'quantity',     i.quantity,
+                         'lineTotal',    i.line_total
+                       ) ORDER BY i.product_title, i.size_code)
+                  FROM order_items i
+                 WHERE i.order_id = o.id
+              ), '[]'::json) AS items
+         FROM orders o
+        WHERE o.user_id = $1
+        ORDER BY o.placed_at DESC
+        LIMIT $2 OFFSET $3`,
+      [userId, limit, (page - 1) * limit]
+    ),
   ]);
 
-  // Field names match the previous response exactly so the storefront's
-  // Orders page needs no changes.
-  const data = orders.map((o) => ({
-    id: o._id.toString(),
-    order_number: o.orderNumber,
-    subtotal: o.subtotal,
-    shipping_fee: o.shippingFee,
-    grand_total: o.grandTotal,
-    payment_method: o.paymentMethod,
-    payment_status: o.paymentStatus,
-    order_status: o.orderStatus,
-    tracking_number: o.trackingNumber,
-    tracking_carrier: o.trackingCarrier,
-    placed_at: o.placedAt,
-    items: o.items.map((i) => ({
-      productTitle: i.productTitle,
-      sku: i.sku,
-      size: i.sizeCode,
-      color: i.colorName,
-      unitPrice: i.unitPrice,
-      quantity: i.quantity,
-      lineTotal: i.lineTotal,
-    })),
-  }));
+  const total = countRows[0].total;
 
   res.json({
     success: true,
-    data,
+    data: rows,
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   });
 });

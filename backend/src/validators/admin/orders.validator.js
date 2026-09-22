@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { objectId } from '../objectId.js';
+import { uuid } from '../uuid.js';
 import { ORDER_STATUSES } from '@shope/shared/orderStatus';
 
 export const listAdminOrdersSchema = {
@@ -16,13 +16,13 @@ export const listAdminOrdersSchema = {
 
 export const orderIdParamSchema = {
   params: z.object({
-    id: objectId,
+    id: uuid,
   }),
 };
 
 export const updateOrderStatusSchema = {
   params: z.object({
-    id: objectId,
+    id: uuid,
   }),
   body: z.object({
     status: z.enum(ORDER_STATUSES),

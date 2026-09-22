@@ -1,53 +1,81 @@
-import mongoose from 'mongoose';
-import { Cart, Product } from '../models/index.js';
+import { query } from '../config/db.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 /**
- * Cart lines only store a product + variant id + quantity; price, stock
- * and imagery are always read live from the product so a cart can never
- * show a stale price. Resolving them means loading the referenced
- * products and matching the embedded variant by its _id.
+ * Cart lines only store a variant + quantity; price, stock and imagery
+ * are always read live through the join so a cart can never show a stale
+ * price.
+ *
+ * The document version had to skip lines whose product or variant had
+ * been deleted since they were added. That case is gone: cart_items holds
+ * a real foreign key to product_variants with ON DELETE CASCADE, so a
+ * deleted variant takes its cart lines with it and a dangling line can no
+ * longer exist to be filtered out.
  */
-async function resolveCartItems(cart) {
-  if (!cart || cart.items.length === 0) return [];
+const CART_ITEMS_SQL = `
+  SELECT ci.variant_id,
+         ci.quantity,
+         v.sku,
+         v.stock_quantity,
+         v.size,
+         v.color,
+         v.color_hex,
+         COALESCE(v.price_override, p.base_price) AS unit_price,
+         p.id    AS product_id,
+         p.title AS product_title,
+         p.slug  AS product_slug,
+         (SELECT pi.image_url
+            FROM product_images pi
+           WHERE pi.product_id = p.id AND pi.is_primary
+           LIMIT 1) AS image
+    FROM cart_items ci
+    JOIN carts c            ON c.id = ci.cart_id
+    JOIN product_variants v ON v.id = ci.variant_id
+    JOIN products p         ON p.id = v.product_id
+   WHERE c.user_id = $1
+   ORDER BY ci.added_at
+`;
 
-  const products = await Product.find({ _id: { $in: cart.items.map((i) => i.product) } }).lean();
-  const byId = new Map(products.map((p) => [p._id.toString(), p]));
-
-  const items = [];
-  for (const line of cart.items) {
-    const product = byId.get(line.product.toString());
-    if (!product) continue; // product deleted since it was added
-    const variant = product.variants.find((v) => v._id.equals(line.variantId));
-    if (!variant) continue; // variant removed since it was added
-
-    const unitPrice = variant.priceOverride ?? product.basePrice;
-    items.push({
-      variantId: variant._id.toString(),
-      quantity: line.quantity,
-      sku: variant.sku,
-      stockQuantity: variant.stockQuantity,
-      unitPrice,
-      lineTotal: unitPrice * line.quantity,
-      productId: product._id.toString(),
-      productTitle: product.title,
-      productSlug: product.slug,
-      size: variant.size,
-      color: variant.color,
-      colorHex: variant.colorHex,
-      image: product.images.find((img) => img.isPrimary)?.imageUrl ?? null,
-    });
-  }
-  return items;
+function toCartItem(row) {
+  return {
+    variantId: row.variant_id,
+    quantity: row.quantity,
+    sku: row.sku,
+    stockQuantity: row.stock_quantity,
+    unitPrice: row.unit_price,
+    lineTotal: row.unit_price * row.quantity,
+    productId: row.product_id,
+    productTitle: row.product_title,
+    productSlug: row.product_slug,
+    size: row.size,
+    color: row.color,
+    colorHex: row.color_hex,
+    image: row.image,
+  };
 }
 
-/** Finds the product owning an embedded variant — the equivalent of the
- *  old `JOIN product_variants v ON v.id = ?`, since an embedded subdoc
- *  can only be reached through its parent document. */
-async function findProductByVariantId(variantId) {
-  if (!mongoose.isValidObjectId(variantId)) return null;
-  return Product.findOne({ 'variants._id': variantId });
+/** The variant a cart operation targets, or a 404 — replaces the
+ *  "find the product that embeds this variant" lookup the document model
+ *  forced, since a variant is a row of its own again. */
+async function findVariant(variantId) {
+  const { rows } = await query(
+    'SELECT id, sku, stock_quantity FROM product_variants WHERE id = $1',
+    [variantId]
+  );
+  if (rows.length === 0) throw ApiError.notFound('Product variant not found');
+  return rows[0];
+}
+
+/** The caller's cart id, creating the cart on first use. */
+async function getOrCreateCartId(userId) {
+  const { rows } = await query(
+    `INSERT INTO carts (user_id) VALUES ($1)
+     ON CONFLICT (user_id) DO UPDATE SET updated_at = now()
+     RETURNING id`,
+    [userId]
+  );
+  return rows[0].id;
 }
 
 /**
@@ -57,8 +85,8 @@ async function findProductByVariantId(variantId) {
  * subtotal — the frontend never has to re-derive pricing itself.
  */
 export const getCart = asyncHandler(async (req, res) => {
-  const cart = await Cart.findOne({ user: req.user.id });
-  const items = await resolveCartItems(cart);
+  const { rows } = await query(CART_ITEMS_SQL, [req.user.id]);
+  const items = rows.map(toCartItem);
   const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0);
 
   res.json({ success: true, data: { items, subtotal } });
@@ -67,44 +95,43 @@ export const getCart = asyncHandler(async (req, res) => {
 /**
  * POST /api/cart
  * Authenticated. Adds `quantity` of a variant, or increments an existing
- * line. The stock check reads the variant's live quantity and the result
- * is written with an upsert; overselling is ultimately prevented at
- * checkout, which decrements stock with a conditional atomic update.
+ * line. The stock check reads the variant's live quantity; overselling is
+ * ultimately prevented at checkout, which decrements stock with a
+ * conditional update.
  */
 export const addToCart = asyncHandler(async (req, res) => {
   const userId = req.user.id;
   const { variantId, quantity } = req.body;
 
-  const product = await findProductByVariantId(variantId);
-  if (!product) throw ApiError.notFound('Product variant not found');
-  const variant = product.variants.id(variantId);
+  const variant = await findVariant(variantId);
+  const cartId = await getOrCreateCartId(userId);
 
-  const cart = await Cart.findOneAndUpdate(
-    { user: userId },
-    { $setOnInsert: { user: userId, items: [] } },
-    { returnDocument: 'after', upsert: true }
+  const { rows: existing } = await query(
+    'SELECT quantity FROM cart_items WHERE cart_id = $1 AND variant_id = $2',
+    [cartId, variantId]
   );
+  const combinedQuantity = (existing[0]?.quantity ?? 0) + quantity;
 
-  const existing = cart.items.find((i) => i.variantId.equals(variant._id));
-  const combinedQuantity = (existing?.quantity ?? 0) + quantity;
-
-  if (combinedQuantity > variant.stockQuantity) {
+  if (combinedQuantity > variant.stock_quantity) {
     throw ApiError.conflict('Not enough stock available', {
       requested: combinedQuantity,
-      available: variant.stockQuantity,
+      available: variant.stock_quantity,
     });
   }
 
-  if (existing) {
-    existing.quantity = combinedQuantity;
-  } else {
-    cart.items.push({ product: product._id, variantId: variant._id, quantity });
-  }
-  await cart.save();
+  // Sets the absolute combined figure rather than adding again, so the
+  // number that was just stock-checked is exactly the number stored.
+  // uq_cart_variant is what keeps this to one line per variant.
+  await query(
+    `INSERT INTO cart_items (cart_id, variant_id, quantity)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (cart_id, variant_id) DO UPDATE SET quantity = $3`,
+    [cartId, variantId, combinedQuantity]
+  );
 
   res.status(201).json({
     success: true,
-    data: { variantId: variant._id.toString(), quantity: combinedQuantity },
+    data: { variantId, quantity: combinedQuantity },
   });
 });
 
@@ -117,25 +144,24 @@ export const updateCartItem = asyncHandler(async (req, res) => {
   const { variantId } = req.params;
   const { quantity } = req.body;
 
-  const product = await findProductByVariantId(variantId);
-  if (!product) throw ApiError.notFound('Product variant not found');
-  const variant = product.variants.id(variantId);
+  const variant = await findVariant(variantId);
 
-  if (quantity > variant.stockQuantity) {
+  if (quantity > variant.stock_quantity) {
     throw ApiError.conflict('Not enough stock available', {
       requested: quantity,
-      available: variant.stockQuantity,
+      available: variant.stock_quantity,
     });
   }
 
-  const cart = await Cart.findOne({ user: req.user.id });
-  const line = cart?.items.find((i) => i.variantId.equals(variant._id));
-  if (!line) throw ApiError.notFound('Item is not in your cart');
+  const { rowCount } = await query(
+    `UPDATE cart_items SET quantity = $1
+      WHERE variant_id = $2
+        AND cart_id = (SELECT id FROM carts WHERE user_id = $3)`,
+    [quantity, variantId, req.user.id]
+  );
+  if (rowCount === 0) throw ApiError.notFound('Item is not in your cart');
 
-  line.quantity = quantity;
-  await cart.save();
-
-  res.json({ success: true, data: { variantId: variant._id.toString(), quantity } });
+  res.json({ success: true, data: { variantId, quantity } });
 });
 
 /**
@@ -144,17 +170,14 @@ export const updateCartItem = asyncHandler(async (req, res) => {
  */
 export const removeCartItem = asyncHandler(async (req, res) => {
   const { variantId } = req.params;
-  if (!mongoose.isValidObjectId(variantId)) {
-    throw ApiError.notFound('Item is not in your cart');
-  }
 
-  const result = await Cart.updateOne(
-    { user: req.user.id },
-    { $pull: { items: { variantId } } }
+  const { rowCount } = await query(
+    `DELETE FROM cart_items
+      WHERE variant_id = $1
+        AND cart_id = (SELECT id FROM carts WHERE user_id = $2)`,
+    [variantId, req.user.id]
   );
-  if (result.modifiedCount === 0) {
-    throw ApiError.notFound('Item is not in your cart');
-  }
+  if (rowCount === 0) throw ApiError.notFound('Item is not in your cart');
 
   res.json({ success: true, data: { variantId } });
 });
@@ -164,6 +187,9 @@ export const removeCartItem = asyncHandler(async (req, res) => {
  * Authenticated. Empties the whole cart (e.g. a "Clear cart" button).
  */
 export const clearCart = asyncHandler(async (req, res) => {
-  await Cart.updateOne({ user: req.user.id }, { $set: { items: [] } });
+  await query(
+    'DELETE FROM cart_items WHERE cart_id = (SELECT id FROM carts WHERE user_id = $1)',
+    [req.user.id]
+  );
   res.json({ success: true, data: null });
 });

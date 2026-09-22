@@ -1,4 +1,4 @@
-import { Category } from '../models/index.js';
+import { query } from '../config/db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 /**
@@ -6,29 +6,21 @@ import { asyncHandler } from '../utils/asyncHandler.js';
  * Public. Flat list of all categories, including their parent (if any).
  * Response keys stay snake_case (parent_id, parent_slug) so the
  * storefront's useCategories hook and the admin's category picker keep
- * working unchanged against the new database.
+ * working unchanged.
  */
 export const getCategories = asyncHandler(async (req, res) => {
-  const categories = await Category.find()
-    .populate('parent', 'slug')
-    .sort({ parent: 1, name: 1 })
-    .lean();
+  // Top-level first, then children, each alphabetically — the ordering is
+  // back in the database rather than being re-sorted in JS afterwards.
+  const { rows } = await query(`
+    SELECT c.id,
+           c.name,
+           c.slug,
+           c.parent_id,
+           p.slug AS parent_slug
+      FROM categories c
+      LEFT JOIN categories p ON p.id = c.parent_id
+     ORDER BY (c.parent_id IS NOT NULL), c.name
+  `);
 
-  const data = categories.map((c) => ({
-    id: c._id.toString(),
-    name: c.name,
-    slug: c.slug,
-    parent_id: c.parent ? c.parent._id.toString() : null,
-    parent_slug: c.parent ? c.parent.slug : null,
-  }));
-
-  // Top-level first, then children — the same ordering the SQL
-  // `ORDER BY parent_id IS NOT NULL, name` produced.
-  data.sort((a, b) => {
-    if (!a.parent_id && b.parent_id) return -1;
-    if (a.parent_id && !b.parent_id) return 1;
-    return a.name.localeCompare(b.name);
-  });
-
-  res.json({ success: true, data });
+  res.json({ success: true, data: rows });
 });

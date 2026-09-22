@@ -10,8 +10,8 @@ import categoriesRoutes from './categories.routes.js';
 // or admin; products/categories: admin only). Not yet built: stats,
 // settings, customers, audit-logs, reviews, coupons — the admin app's
 // sidebar shows an honest "Not built yet" placeholder for each of those,
-// not a broken link. Blog was dropped entirely (not just deferred) —
-// see migrations README's note on migration 009's down script.
+// not a broken link. Blog was dropped entirely (not just deferred), so
+// there is nothing left of it in the schema to build against.
 const router = Router();
 
 router.use('/orders', ordersRoutes);
